@@ -1,6 +1,8 @@
 using Microsoft.EntityFrameworkCore;
 using Npgsql;
+using ServiceDesk.Core.Application.Authentication.Login;
 using ServiceDesk.Core.Application.Tickets.ListTickets;
+using ServiceDesk.Core.Security;
 using ServiceDesk.Core.Entities;
 using ServiceDesk.Core.Enums;
 using ServiceDesk.Infrastructure.Persistence;
@@ -43,6 +45,56 @@ public class PostgreSqlPersistenceTests
             Assert.Equal(UserRole.Technician, reloaded.Role);
             Assert.Equal(createdAt, reloaded.CreatedAt);
             Assert.True(reloaded.IsActive);
+        }
+        finally
+        {
+            await DeleteUserAsync(user.Id);
+        }
+    }
+
+    [PostgreSqlIntegrationFact]
+    public async Task AuthenticationQueries_NormalizedEmailAndActiveState_ReturnCurrentUserState()
+    {
+        var user = User.Create(
+            EmailAddress.Normalize($"  AUTH-{Guid.NewGuid():N}@Example.COM "),
+            "integration-password-hash",
+            "Auth",
+            "User",
+            UserRole.Employee,
+            UtcNowAtPostgreSqlPrecision());
+
+        try
+        {
+            await using (var writeContext = CreateContext())
+            {
+                writeContext.Users.Add(user);
+                await writeContext.SaveChangesAsync();
+            }
+
+            await using (var queryContext = CreateContext())
+            {
+                var loginQuery = new LoginUserQuery(queryContext);
+                var stateQuery = new CurrentUserStateQuery(queryContext);
+                var loginUser = await loginQuery.FindByNormalizedEmailAsync(
+                    user.Email,
+                    CancellationToken.None);
+
+                Assert.NotNull(loginUser);
+                Assert.Equal(user.Id, loginUser.Id);
+                Assert.Equal(user.Email, loginUser.Email);
+                Assert.True(await stateQuery.IsActiveAsync(user.Id, CancellationToken.None));
+            }
+
+            await using (var updateContext = CreateContext())
+            {
+                var storedUser = await updateContext.Users.SingleAsync(candidate => candidate.Id == user.Id);
+                storedUser.Deactivate();
+                await updateContext.SaveChangesAsync();
+            }
+
+            await using var inactiveContext = CreateContext();
+            var inactiveStateQuery = new CurrentUserStateQuery(inactiveContext);
+            Assert.False(await inactiveStateQuery.IsActiveAsync(user.Id, CancellationToken.None));
         }
         finally
         {

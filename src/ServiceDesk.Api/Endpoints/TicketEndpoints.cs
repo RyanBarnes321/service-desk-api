@@ -1,4 +1,7 @@
+using System.IdentityModel.Tokens.Jwt;
+using System.Security.Claims;
 using ServiceDesk.Api.Contracts.Tickets;
+using ServiceDesk.Api.Security;
 using ServiceDesk.Core.Application.Tickets.CreateTicket;
 using ServiceDesk.Core.Application.Tickets.GetTicket;
 using ServiceDesk.Core.Application.Tickets.ListTickets;
@@ -16,6 +19,7 @@ public static class TicketEndpoints
         tickets.MapPost("/", CreateAsync);
         tickets.MapGet("/", ListAsync);
         tickets.MapGet("/{id:guid}", GetAsync).WithName(GetTicketRouteName);
+        tickets.RequireAuthorization(ActiveUserPolicy.Name);
 
         return endpoints;
     }
@@ -23,17 +27,22 @@ public static class TicketEndpoints
     private static async Task<IResult> CreateAsync(
         CreateTicketRequest request,
         CreateTicketUseCase useCase,
+        ClaimsPrincipal user,
         CancellationToken cancellationToken)
     {
+        if (!TryGetSubject(user, out var userId))
+        {
+            return Results.Forbid();
+        }
+
         try
         {
-            // TODO: Derive CreatedByUserId from authenticated identity once authentication is introduced.
             var command = new CreateTicketCommand(
                 request.Title,
                 request.Description,
                 request.Category,
                 request.Priority,
-                request.CreatedByUserId);
+                userId);
             var result = await useCase.ExecuteAsync(command, cancellationToken);
             var response = new CreateTicketResponse(
                 result.Id,
@@ -163,5 +172,13 @@ public static class TicketEndpoints
             "createdFrom" or
             "sortField" or
             "sortDirection";
+    }
+
+    private static bool TryGetSubject(ClaimsPrincipal user, out Guid userId)
+    {
+        return Guid.TryParse(
+                user.FindFirst(JwtRegisteredClaimNames.Sub)?.Value,
+                out userId) &&
+            userId != Guid.Empty;
     }
 }

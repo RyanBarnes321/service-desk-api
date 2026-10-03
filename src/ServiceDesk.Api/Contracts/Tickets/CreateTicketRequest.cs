@@ -6,5 +6,4 @@ public sealed record CreateTicketRequest(
     string Title,
     string Description,
     TicketCategory Category,
-    TicketPriority Priority,
-    Guid CreatedByUserId);
+    TicketPriority Priority);

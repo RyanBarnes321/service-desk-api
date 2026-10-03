@@ -1,14 +1,19 @@
 using System.Net;
 using System.Net.Http.Json;
+using System.Net.Http.Headers;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.AspNetCore.TestHost;
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
+using Microsoft.IdentityModel.Tokens;
+using ServiceDesk.Api.Tests.Security;
 using ServiceDesk.Api.Contracts.Tickets;
+using ServiceDesk.Core.Application.Authentication;
 using ServiceDesk.Core.Application.Tickets.CreateTicket;
 using ServiceDesk.Core.Application.Tickets.GetTicket;
 using ServiceDesk.Core.Application.Tickets.ListTickets;
@@ -42,7 +47,8 @@ public class TicketEndpointsTests
         Assert.Equal(TicketCategory.Network, body.Category);
         Assert.Equal(TicketPriority.High, body.Priority);
         Assert.Equal(TicketStatus.Open, body.Status);
-        Assert.Equal(request.CreatedByUserId, body.CreatedByUserId);
+        Assert.Equal(factory.UserId, body.CreatedByUserId);
+        Assert.Equal(factory.UserId, factory.Persistence.PersistedTicket?.CreatedByUserId);
         Assert.Equal($"/api/tickets/{body.Id}", response.Headers.Location?.AbsolutePath);
 
         var json = await response.Content.ReadAsStringAsync();
@@ -264,14 +270,86 @@ public class TicketEndpointsTests
         Assert.Equal(0, factory.ListQuery.CallCount);
     }
 
+    [Theory]
+    [InlineData("post", "/api/tickets")]
+    [InlineData("get", "/api/tickets")]
+    [InlineData("get", "/api/tickets/11111111-1111-1111-1111-111111111111")]
+    public async Task TicketRoute_AnonymousRequest_ReturnsUnauthorized(string method, string path)
+    {
+        await using var factory = new TicketApiFactory();
+        using var client = factory.CreateHttpsClient(authenticated: false);
+
+        var response = method == "post"
+            ? await client.PostAsJsonAsync(path, ValidCreateRequest())
+            : await client.GetAsync(path);
+
+        Assert.Equal(HttpStatusCode.Unauthorized, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task TicketRoute_DeactivatedCurrentUserWithValidToken_ReturnsForbidden()
+    {
+        await using var factory = new TicketApiFactory(isCurrentUserActive: false);
+        using var client = factory.CreateHttpsClient();
+
+        var response = await client.GetAsync("/api/tickets");
+
+        Assert.Equal(HttpStatusCode.Forbidden, response.StatusCode);
+        Assert.Equal(1, factory.UserState.CallCount);
+    }
+
+    [Fact]
+    public async Task TicketRoute_InvalidJwtVariants_ReturnUnauthorizedBeforeActiveUserLookup()
+    {
+        await using var factory = new TicketApiFactory();
+        var tokens = new[]
+        {
+            TestJwt.Create(
+                factory.UserId,
+                signingKey: "different-test-only-signing-key-that-is-also-at-least-sixty-four-characters"),
+            TestJwt.Create(factory.UserId, expiresAt: DateTimeOffset.UtcNow.AddMinutes(-1)),
+            TestJwt.Create(factory.UserId, issuer: "wrong-issuer"),
+            TestJwt.Create(factory.UserId, audience: "wrong-audience"),
+            TestJwt.Create(factory.UserId, algorithm: SecurityAlgorithms.HmacSha384)
+        };
+
+        foreach (var token in tokens)
+        {
+            using var client = factory.CreateHttpsClient(accessToken: token);
+            var response = await client.GetAsync("/api/tickets");
+            Assert.Equal(HttpStatusCode.Unauthorized, response.StatusCode);
+        }
+
+        Assert.Equal(0, factory.UserState.CallCount);
+    }
+
+    [Fact]
+    public async Task Post_BodyCreatedByUserIdCannotOverrideAuthenticatedSubject()
+    {
+        await using var factory = new TicketApiFactory();
+        using var client = factory.CreateHttpsClient();
+        var body = new
+        {
+            title = "Cannot connect to VPN",
+            description = "The VPN client times out during connection.",
+            category = TicketCategory.Network,
+            priority = TicketPriority.High,
+            createdByUserId = Guid.NewGuid()
+        };
+
+        var response = await client.PostAsJsonAsync("/api/tickets", body);
+
+        Assert.Equal(HttpStatusCode.Created, response.StatusCode);
+        Assert.Equal(factory.UserId, factory.Persistence.PersistedTicket?.CreatedByUserId);
+    }
+
     private static CreateTicketRequest ValidCreateRequest()
     {
         return new CreateTicketRequest(
             "Cannot connect to VPN",
             "The VPN client times out during connection.",
             TicketCategory.Network,
-            TicketPriority.High,
-            Guid.NewGuid());
+            TicketPriority.High);
     }
 
     private static GetTicketResult TicketResult(Guid id)
@@ -315,12 +393,17 @@ public class TicketEndpointsTests
         public TicketApiFactory(
             GetTicketResult? queryResult = null,
             ArgumentException? persistenceException = null,
-            ListTicketsResult? listResult = null)
+            ListTicketsResult? listResult = null,
+            bool isCurrentUserActive = true)
         {
+            UserId = Guid.NewGuid();
             Query = new StubGetTicketQuery(queryResult);
             Persistence = new RecordingCreateTicketPersistence(persistenceException);
             ListQuery = new StubListTicketsQuery(listResult ?? new ListTicketsResult([], 1, 20, 0, 0));
+            UserState = new StubCurrentUserStateQuery(isCurrentUserActive);
         }
+
+        public Guid UserId { get; }
 
         public RecordingCreateTicketPersistence Persistence { get; }
 
@@ -328,25 +411,44 @@ public class TicketEndpointsTests
 
         public StubListTicketsQuery ListQuery { get; }
 
-        public HttpClient CreateHttpsClient()
+        public StubCurrentUserStateQuery UserState { get; }
+
+        public HttpClient CreateHttpsClient(
+            bool authenticated = true,
+            string? accessToken = null)
         {
-            return CreateClient(new WebApplicationFactoryClientOptions
+            var client = CreateClient(new WebApplicationFactoryClientOptions
             {
                 BaseAddress = new Uri("https://localhost")
             });
+
+            if (authenticated)
+            {
+                client.DefaultRequestHeaders.Authorization =
+                    new AuthenticationHeaderValue("Bearer", accessToken ?? TestJwt.Create(UserId));
+            }
+
+            return client;
         }
 
         protected override void ConfigureWebHost(IWebHostBuilder builder)
         {
             builder.UseEnvironment("Production");
+            builder.UseSetting("Jwt:SigningKey", TestJwt.SigningKey);
+            builder.UseSetting("Jwt:Issuer", TestJwt.Issuer);
+            builder.UseSetting("Jwt:Audience", TestJwt.Audience);
+            builder.ConfigureAppConfiguration((_, configuration) =>
+                configuration.AddInMemoryCollection(TestJwt.Configuration));
             builder.ConfigureTestServices(services =>
             {
                 services.RemoveAll<ICreateTicketPersistence>();
                 services.RemoveAll<IGetTicketQuery>();
                 services.RemoveAll<IListTicketsQuery>();
+                services.RemoveAll<ICurrentUserStateQuery>();
                 services.AddSingleton<ICreateTicketPersistence>(Persistence);
                 services.AddSingleton<IGetTicketQuery>(Query);
                 services.AddSingleton<IListTicketsQuery>(ListQuery);
+                services.AddSingleton<ICurrentUserStateQuery>(UserState);
             });
         }
     }
@@ -356,12 +458,15 @@ public class TicketEndpointsTests
     {
         public int CallCount { get; private set; }
 
+        public Ticket? PersistedTicket { get; private set; }
+
         public Task PersistAsync(
             Ticket ticket,
             TicketHistory history,
             CancellationToken cancellationToken)
         {
             CallCount++;
+            PersistedTicket = ticket;
 
             if (exception is not null)
             {
@@ -369,6 +474,17 @@ public class TicketEndpointsTests
             }
 
             return Task.CompletedTask;
+        }
+    }
+
+    private sealed class StubCurrentUserStateQuery(bool isActive) : ICurrentUserStateQuery
+    {
+        public int CallCount { get; private set; }
+
+        public Task<bool> IsActiveAsync(Guid userId, CancellationToken cancellationToken)
+        {
+            CallCount++;
+            return Task.FromResult(isActive);
         }
     }
 
