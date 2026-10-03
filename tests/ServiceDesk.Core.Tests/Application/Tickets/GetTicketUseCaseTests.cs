@@ -1,3 +1,5 @@
+using ServiceDesk.Core.Application.Authentication;
+using ServiceDesk.Core.Application.Tickets;
 using ServiceDesk.Core.Application.Tickets.GetTicket;
 using ServiceDesk.Core.Enums;
 
@@ -13,12 +15,14 @@ public class GetTicketUseCaseTests
         var useCase = new GetTicketUseCase(query);
         using var cancellationSource = new CancellationTokenSource();
 
-        var result = await useCase.ExecuteAsync(expected.Id, cancellationSource.Token);
+        var actor = Actor(UserRole.Employee);
+        var result = await useCase.ExecuteAsync(expected.Id, actor, cancellationSource.Token);
 
         Assert.Same(expected, result);
         Assert.Equal(expected.Id, query.QueriedId);
         Assert.Equal(cancellationSource.Token, query.CancellationToken);
         Assert.Equal(1, query.CallCount);
+        Assert.Equal(actor.UserId, query.Visibility?.CreatedByUserId);
     }
 
     [Fact]
@@ -27,7 +31,7 @@ public class GetTicketUseCaseTests
         var query = new RecordingQuery(null);
         var useCase = new GetTicketUseCase(query);
 
-        var result = await useCase.ExecuteAsync(Guid.NewGuid());
+        var result = await useCase.ExecuteAsync(Guid.NewGuid(), Actor(UserRole.Employee));
 
         Assert.Null(result);
         Assert.Equal(1, query.CallCount);
@@ -40,7 +44,7 @@ public class GetTicketUseCaseTests
         var useCase = new GetTicketUseCase(query);
 
         var exception = await Assert.ThrowsAsync<ArgumentException>(
-            () => useCase.ExecuteAsync(Guid.Empty));
+            () => useCase.ExecuteAsync(Guid.Empty, Actor(UserRole.Employee)));
 
         Assert.Equal("id", exception.ParamName);
         Assert.Equal(0, query.CallCount);
@@ -55,10 +59,29 @@ public class GetTicketUseCaseTests
         cancellationSource.Cancel();
 
         await Assert.ThrowsAnyAsync<OperationCanceledException>(
-            () => useCase.ExecuteAsync(Guid.NewGuid(), cancellationSource.Token));
+            () => useCase.ExecuteAsync(
+                Guid.NewGuid(),
+                Actor(UserRole.Employee),
+                cancellationSource.Token));
 
         Assert.Equal(0, query.CallCount);
     }
+
+    [Theory]
+    [InlineData(UserRole.Technician)]
+    [InlineData(UserRole.Administrator)]
+    public async Task ExecuteAsync_PrivilegedActor_DelegatesUnrestrictedVisibility(UserRole role)
+    {
+        var query = new RecordingQuery(null);
+        var useCase = new GetTicketUseCase(query);
+
+        await useCase.ExecuteAsync(Guid.NewGuid(), Actor(role));
+
+        Assert.NotNull(query.Visibility);
+        Assert.Null(query.Visibility.CreatedByUserId);
+    }
+
+    private static RequestActor Actor(UserRole role) => new(Guid.NewGuid(), role);
 
     private static GetTicketResult TicketResult(Guid id)
     {
@@ -88,10 +111,16 @@ public class GetTicketUseCaseTests
 
         public CancellationToken CancellationToken { get; private set; }
 
-        public Task<GetTicketResult?> FindAsync(Guid id, CancellationToken cancellationToken)
+        public TicketVisibilityScope? Visibility { get; private set; }
+
+        public Task<GetTicketResult?> FindAsync(
+            Guid id,
+            TicketVisibilityScope visibility,
+            CancellationToken cancellationToken)
         {
             CallCount++;
             QueriedId = id;
+            Visibility = visibility;
             CancellationToken = cancellationToken;
             return Task.FromResult(result);
         }

@@ -5,10 +5,12 @@ namespace ServiceDesk.Infrastructure.Persistence;
 
 public sealed class CurrentUserStateQuery(ServiceDeskDbContext dbContext) : ICurrentUserStateQuery
 {
-    public Task<bool> IsActiveAsync(Guid userId, CancellationToken cancellationToken)
+    public Task<CurrentUserState?> FindAsync(Guid userId, CancellationToken cancellationToken)
     {
         return dbContext.Users
             .AsNoTracking()
-            .AnyAsync(user => user.Id == userId && user.IsActive, cancellationToken);
+            .Where(user => user.Id == userId)
+            .Select(user => new CurrentUserState(user.Id, user.Role, user.IsActive))
+            .SingleOrDefaultAsync(cancellationToken);
     }
 }

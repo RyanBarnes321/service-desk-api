@@ -18,7 +18,8 @@ internal static class TestJwt
         string issuer = Issuer,
         string audience = Audience,
         string signingKey = SigningKey,
-        string algorithm = SecurityAlgorithms.HmacSha256)
+        string algorithm = SecurityAlgorithms.HmacSha256,
+        UserRole role = UserRole.Employee)
     {
         var now = DateTimeOffset.UtcNow;
         var expiration = expiresAt ?? now.AddMinutes(10);
@@ -29,7 +30,7 @@ internal static class TestJwt
             [
                 new Claim(JwtRegisteredClaimNames.Sub, userId.ToString()),
                 new Claim(JwtRegisteredClaimNames.Email, "user@example.com"),
-                new Claim("role", UserRole.Employee.ToString())
+                new Claim("role", role.ToString())
             ],
             notBefore.UtcDateTime,
             expiration.UtcDateTime,

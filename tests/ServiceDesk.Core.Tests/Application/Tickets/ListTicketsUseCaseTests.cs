@@ -1,3 +1,5 @@
+using ServiceDesk.Core.Application.Authentication;
+using ServiceDesk.Core.Application.Tickets;
 using ServiceDesk.Core.Application.Tickets.ListTickets;
 using ServiceDesk.Core.Enums;
 
@@ -11,7 +13,7 @@ public class ListTicketsUseCaseTests
         var query = new RecordingQuery();
         var useCase = new ListTicketsUseCase(query);
 
-        await useCase.ExecuteAsync(new ListTicketsRequest());
+        await useCase.ExecuteAsync(new ListTicketsRequest(), EmployeeActor());
 
         Assert.NotNull(query.Request);
         Assert.Equal(1, query.Request.Page);
@@ -27,7 +29,7 @@ public class ListTicketsUseCaseTests
         var useCase = new ListTicketsUseCase(query);
 
         var exception = await Assert.ThrowsAsync<ArgumentOutOfRangeException>(
-            () => useCase.ExecuteAsync(new ListTicketsRequest(Page: 0)));
+            () => useCase.ExecuteAsync(new ListTicketsRequest(Page: 0), EmployeeActor()));
 
         Assert.Equal("page", exception.ParamName);
         Assert.Equal(0, query.CallCount);
@@ -50,7 +52,7 @@ public class ListTicketsUseCaseTests
         };
 
         var exception = await Assert.ThrowsAsync<ArgumentOutOfRangeException>(
-            () => useCase.ExecuteAsync(request));
+            () => useCase.ExecuteAsync(request, EmployeeActor()));
 
         Assert.Equal(parameterName, exception.ParamName);
         Assert.Equal(0, query.CallCount);
@@ -65,7 +67,9 @@ public class ListTicketsUseCaseTests
         var useCase = new ListTicketsUseCase(query);
 
         var exception = await Assert.ThrowsAsync<ArgumentOutOfRangeException>(
-            () => useCase.ExecuteAsync(new ListTicketsRequest(PageSize: pageSize)));
+            () => useCase.ExecuteAsync(
+                new ListTicketsRequest(PageSize: pageSize),
+                EmployeeActor()));
 
         Assert.Equal("pageSize", exception.ParamName);
         Assert.Equal(0, query.CallCount);
@@ -81,7 +85,7 @@ public class ListTicketsUseCaseTests
         var exception = await Assert.ThrowsAsync<ArgumentException>(() =>
             useCase.ExecuteAsync(new ListTicketsRequest(
                 CreatedFrom: from,
-                CreatedTo: from.AddTicks(-1))));
+                CreatedTo: from.AddTicks(-1)), EmployeeActor()));
 
         Assert.Equal("createdFrom", exception.ParamName);
         Assert.Equal(0, query.CallCount);
@@ -93,7 +97,7 @@ public class ListTicketsUseCaseTests
         var query = new RecordingQuery();
         var useCase = new ListTicketsUseCase(query);
 
-        await useCase.ExecuteAsync(new ListTicketsRequest(Search: " \t "));
+        await useCase.ExecuteAsync(new ListTicketsRequest(Search: " \t "), EmployeeActor());
 
         Assert.NotNull(query.Request);
         Assert.Null(query.Request.Search);
@@ -108,7 +112,10 @@ public class ListTicketsUseCaseTests
         cancellationSource.Cancel();
 
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
-            useCase.ExecuteAsync(new ListTicketsRequest(), cancellationSource.Token));
+            useCase.ExecuteAsync(
+                new ListTicketsRequest(),
+                EmployeeActor(),
+                cancellationSource.Token));
 
         Assert.Equal(0, query.CallCount);
     }
@@ -137,13 +144,34 @@ public class ListTicketsUseCaseTests
             TicketSortField.CreatedAt,
             TicketSortDirection.Asc);
 
-        var result = await useCase.ExecuteAsync(request, cancellationSource.Token);
+        var actor = EmployeeActor();
+        var result = await useCase.ExecuteAsync(request, actor, cancellationSource.Token);
 
         Assert.Same(query.Result, result);
         Assert.Equal(1, query.CallCount);
         Assert.Equal(request with { Search = "VPN issue" }, query.Request);
         Assert.Equal(cancellationSource.Token, query.CancellationToken);
+        Assert.Equal(actor.UserId, query.Visibility?.CreatedByUserId);
     }
+
+    [Theory]
+    [InlineData(UserRole.Technician)]
+    [InlineData(UserRole.Administrator)]
+    public async Task ExecuteAsync_PrivilegedActor_PreservesCreatorFilterWithBroadVisibility(UserRole role)
+    {
+        var query = new RecordingQuery();
+        var useCase = new ListTicketsUseCase(query);
+        var creatorFilter = Guid.NewGuid();
+
+        await useCase.ExecuteAsync(
+            new ListTicketsRequest(CreatedByUserId: creatorFilter),
+            new RequestActor(Guid.NewGuid(), role));
+
+        Assert.Null(query.Visibility?.CreatedByUserId);
+        Assert.Equal(creatorFilter, query.Request?.CreatedByUserId);
+    }
+
+    private static RequestActor EmployeeActor() => new(Guid.NewGuid(), UserRole.Employee);
 
     private sealed class RecordingQuery : IListTicketsQuery
     {
@@ -155,12 +183,16 @@ public class ListTicketsUseCaseTests
 
         public CancellationToken CancellationToken { get; private set; }
 
+        public TicketVisibilityScope? Visibility { get; private set; }
+
         public Task<ListTicketsResult> ListAsync(
             ListTicketsRequest request,
+            TicketVisibilityScope visibility,
             CancellationToken cancellationToken)
         {
             CallCount++;
             Request = request;
+            Visibility = visibility;
             CancellationToken = cancellationToken;
             return Task.FromResult(Result);
         }

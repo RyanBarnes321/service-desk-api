@@ -14,6 +14,7 @@ using Microsoft.IdentityModel.Tokens;
 using ServiceDesk.Api.Tests.Security;
 using ServiceDesk.Api.Contracts.Tickets;
 using ServiceDesk.Core.Application.Authentication;
+using ServiceDesk.Core.Application.Tickets;
 using ServiceDesk.Core.Application.Tickets.CreateTicket;
 using ServiceDesk.Core.Application.Tickets.GetTicket;
 using ServiceDesk.Core.Application.Tickets.ListTickets;
@@ -94,8 +95,9 @@ public class TicketEndpointsTests
     public async Task Get_ExistingTicket_ReturnsOkBodyAndReadableEnums()
     {
         var ticketId = Guid.NewGuid();
-        var ticket = TicketResult(ticketId);
-        await using var factory = new TicketApiFactory(ticket);
+        var userId = Guid.NewGuid();
+        var ticket = TicketResult(ticketId, userId);
+        await using var factory = new TicketApiFactory(ticket, currentUserId: userId);
         using var client = factory.CreateHttpsClient();
 
         var response = await client.GetAsync($"/api/tickets/{ticketId}");
@@ -154,9 +156,12 @@ public class TicketEndpointsTests
     [Fact]
     public async Task List_DefaultRequest_ReturnsPageMetadataAndReadableEnums()
     {
-        var item = ListItem(Guid.NewGuid());
+        var userId = Guid.NewGuid();
+        var item = ListItem(Guid.NewGuid(), userId);
         var listResult = new ListTicketsResult([item], 1, 20, 1, 1);
-        await using var factory = new TicketApiFactory(listResult: listResult);
+        await using var factory = new TicketApiFactory(
+            listResult: listResult,
+            currentUserId: userId);
         using var client = factory.CreateHttpsClient();
 
         var response = await client.GetAsync("/api/tickets");
@@ -299,6 +304,30 @@ public class TicketEndpointsTests
     }
 
     [Fact]
+    public async Task TicketRoute_MissingCurrentUserWithValidToken_ReturnsForbidden()
+    {
+        await using var factory = new TicketApiFactory(currentUserExists: false);
+        using var client = factory.CreateHttpsClient();
+
+        var response = await client.GetAsync("/api/tickets");
+
+        Assert.Equal(HttpStatusCode.Forbidden, response.StatusCode);
+        Assert.Equal(1, factory.UserState.CallCount);
+    }
+
+    [Fact]
+    public async Task TicketRoute_UndefinedPersistedRole_FailsClosed()
+    {
+        await using var factory = new TicketApiFactory(persistedRole: (UserRole)999);
+        using var client = factory.CreateHttpsClient();
+
+        var response = await client.GetAsync("/api/tickets");
+
+        Assert.Equal(HttpStatusCode.Forbidden, response.StatusCode);
+        Assert.Equal(1, factory.UserState.CallCount);
+    }
+
+    [Fact]
     public async Task TicketRoute_InvalidJwtVariants_ReturnUnauthorizedBeforeActiveUserLookup()
     {
         await using var factory = new TicketApiFactory();
@@ -343,6 +372,125 @@ public class TicketEndpointsTests
         Assert.Equal(factory.UserId, factory.Persistence.PersistedTicket?.CreatedByUserId);
     }
 
+    [Fact]
+    public async Task Get_EmployeeOwnTicketReturnsOkAndOtherTicketReturnsNotFound()
+    {
+        var employeeId = Guid.NewGuid();
+        var ownTicket = TicketResult(Guid.NewGuid(), employeeId);
+        await using var ownFactory = new TicketApiFactory(
+            ownTicket,
+            currentUserId: employeeId,
+            persistedRole: UserRole.Employee);
+        using var ownClient = ownFactory.CreateHttpsClient();
+
+        var ownResponse = await ownClient.GetAsync($"/api/tickets/{ownTicket.Id}");
+
+        Assert.Equal(HttpStatusCode.OK, ownResponse.StatusCode);
+        Assert.Equal(1, ownFactory.UserState.CallCount);
+
+        var otherTicket = TicketResult(Guid.NewGuid(), Guid.NewGuid());
+        await using var otherFactory = new TicketApiFactory(
+            otherTicket,
+            currentUserId: employeeId,
+            persistedRole: UserRole.Employee);
+        using var otherClient = otherFactory.CreateHttpsClient();
+
+        var otherResponse = await otherClient.GetAsync($"/api/tickets/{otherTicket.Id}");
+
+        Assert.Equal(HttpStatusCode.NotFound, otherResponse.StatusCode);
+        Assert.Equal(1, otherFactory.UserState.CallCount);
+    }
+
+    [Fact]
+    public async Task List_EmployeeSeesOnlyOwnTicketsAndOtherCreatorFilterIsEmpty()
+    {
+        var employeeId = Guid.NewGuid();
+        var otherCreatorId = Guid.NewGuid();
+        var listResult = new ListTicketsResult(
+            [ListItem(Guid.NewGuid(), employeeId), ListItem(Guid.NewGuid(), otherCreatorId)],
+            1,
+            20,
+            2,
+            1);
+        await using var factory = new TicketApiFactory(
+            listResult: listResult,
+            currentUserId: employeeId,
+            persistedRole: UserRole.Employee);
+        using var client = factory.CreateHttpsClient();
+
+        var ownResponse = await client.GetFromJsonAsync<ListTicketsResponse>(
+            "/api/tickets",
+            JsonOptions);
+        var otherFilterResponse = await client.GetFromJsonAsync<ListTicketsResponse>(
+            $"/api/tickets?createdByUserId={otherCreatorId}",
+            JsonOptions);
+
+        Assert.NotNull(ownResponse);
+        Assert.Equal(employeeId, Assert.Single(ownResponse.Items).CreatedByUserId);
+        Assert.Equal(1, ownResponse.TotalCount);
+        Assert.NotNull(otherFilterResponse);
+        Assert.Empty(otherFilterResponse.Items);
+        Assert.Equal(0, otherFilterResponse.TotalCount);
+        Assert.Equal(0, otherFilterResponse.TotalPages);
+        Assert.Equal(2, factory.UserState.CallCount);
+    }
+
+    [Theory]
+    [InlineData(UserRole.Technician)]
+    [InlineData(UserRole.Administrator)]
+    public async Task Read_PrivilegedPersistedRoleSeesOtherDetailAndMultipleCreators(UserRole role)
+    {
+        var actorId = Guid.NewGuid();
+        var otherCreatorId = Guid.NewGuid();
+        var ticket = TicketResult(Guid.NewGuid(), otherCreatorId);
+        var listResult = new ListTicketsResult(
+            [ListItem(Guid.NewGuid(), actorId), ListItem(Guid.NewGuid(), otherCreatorId)],
+            1,
+            20,
+            2,
+            1);
+        await using var factory = new TicketApiFactory(
+            ticket,
+            listResult: listResult,
+            currentUserId: actorId,
+            persistedRole: role);
+        using var client = factory.CreateHttpsClient();
+
+        var detailResponse = await client.GetAsync($"/api/tickets/{ticket.Id}");
+        var listResponse = await client.GetFromJsonAsync<ListTicketsResponse>(
+            "/api/tickets",
+            JsonOptions);
+
+        Assert.Equal(HttpStatusCode.OK, detailResponse.StatusCode);
+        Assert.NotNull(listResponse);
+        Assert.Equal(2, listResponse.Items.Count);
+        Assert.Equal(2, listResponse.TotalCount);
+        Assert.Equal(2, factory.UserState.CallCount);
+    }
+
+    [Theory]
+    [InlineData(UserRole.Administrator, UserRole.Employee, HttpStatusCode.NotFound)]
+    [InlineData(UserRole.Employee, UserRole.Technician, HttpStatusCode.OK)]
+    public async Task Get_PersistedRoleOverridesStaleJwtRole(
+        UserRole jwtRole,
+        UserRole persistedRole,
+        HttpStatusCode expectedStatus)
+    {
+        var actorId = Guid.NewGuid();
+        var otherTicket = TicketResult(Guid.NewGuid(), Guid.NewGuid());
+        await using var factory = new TicketApiFactory(
+            otherTicket,
+            currentUserId: actorId,
+            persistedRole: persistedRole,
+            jwtRole: jwtRole);
+        using var client = factory.CreateHttpsClient();
+
+        var response = await client.GetAsync($"/api/tickets/{otherTicket.Id}");
+
+        Assert.Equal(expectedStatus, response.StatusCode);
+        Assert.Equal(1, factory.UserState.CallCount);
+    }
+
     private static CreateTicketRequest ValidCreateRequest()
     {
         return new CreateTicketRequest(
@@ -352,7 +500,7 @@ public class TicketEndpointsTests
             TicketPriority.High);
     }
 
-    private static GetTicketResult TicketResult(Guid id)
+    private static GetTicketResult TicketResult(Guid id, Guid? createdByUserId = null)
     {
         var createdAt = new DateTimeOffset(2026, 10, 2, 14, 0, 0, TimeSpan.Zero);
 
@@ -363,7 +511,7 @@ public class TicketEndpointsTests
             TicketCategory.Network,
             TicketPriority.High,
             TicketStatus.Open,
-            Guid.NewGuid(),
+            createdByUserId ?? Guid.NewGuid(),
             null,
             null,
             createdAt,
@@ -372,7 +520,7 @@ public class TicketEndpointsTests
             null);
     }
 
-    private static ListTicketItem ListItem(Guid id)
+    private static ListTicketItem ListItem(Guid id, Guid? createdByUserId = null)
     {
         var createdAt = new DateTimeOffset(2026, 10, 2, 14, 0, 0, TimeSpan.Zero);
 
@@ -382,7 +530,7 @@ public class TicketEndpointsTests
             TicketCategory.Network,
             TicketPriority.High,
             TicketStatus.Assigned,
-            Guid.NewGuid(),
+            createdByUserId ?? Guid.NewGuid(),
             Guid.NewGuid(),
             createdAt,
             createdAt.AddMinutes(1));
@@ -394,16 +542,26 @@ public class TicketEndpointsTests
             GetTicketResult? queryResult = null,
             ArgumentException? persistenceException = null,
             ListTicketsResult? listResult = null,
-            bool isCurrentUserActive = true)
+            bool isCurrentUserActive = true,
+            UserRole persistedRole = UserRole.Employee,
+            UserRole jwtRole = UserRole.Employee,
+            Guid? currentUserId = null,
+            bool currentUserExists = true)
         {
-            UserId = Guid.NewGuid();
+            UserId = currentUserId ?? Guid.NewGuid();
+            JwtRole = jwtRole;
             Query = new StubGetTicketQuery(queryResult);
             Persistence = new RecordingCreateTicketPersistence(persistenceException);
             ListQuery = new StubListTicketsQuery(listResult ?? new ListTicketsResult([], 1, 20, 0, 0));
-            UserState = new StubCurrentUserStateQuery(isCurrentUserActive);
+            UserState = new StubCurrentUserStateQuery(
+                isCurrentUserActive,
+                persistedRole,
+                currentUserExists);
         }
 
         public Guid UserId { get; }
+
+        public UserRole JwtRole { get; }
 
         public RecordingCreateTicketPersistence Persistence { get; }
 
@@ -425,7 +583,9 @@ public class TicketEndpointsTests
             if (authenticated)
             {
                 client.DefaultRequestHeaders.Authorization =
-                    new AuthenticationHeaderValue("Bearer", accessToken ?? TestJwt.Create(UserId));
+                    new AuthenticationHeaderValue(
+                        "Bearer",
+                        accessToken ?? TestJwt.Create(UserId, role: JwtRole));
             }
 
             return client;
@@ -477,14 +637,18 @@ public class TicketEndpointsTests
         }
     }
 
-    private sealed class StubCurrentUserStateQuery(bool isActive) : ICurrentUserStateQuery
+    private sealed class StubCurrentUserStateQuery(
+        bool isActive,
+        UserRole role,
+        bool exists) : ICurrentUserStateQuery
     {
         public int CallCount { get; private set; }
 
-        public Task<bool> IsActiveAsync(Guid userId, CancellationToken cancellationToken)
+        public Task<CurrentUserState?> FindAsync(Guid userId, CancellationToken cancellationToken)
         {
             CallCount++;
-            return Task.FromResult(isActive);
+            CurrentUserState? state = exists ? new(userId, role, isActive) : null;
+            return Task.FromResult<CurrentUserState?>(state);
         }
     }
 
@@ -494,11 +658,19 @@ public class TicketEndpointsTests
 
         public Guid QueriedId { get; private set; }
 
-        public Task<GetTicketResult?> FindAsync(Guid id, CancellationToken cancellationToken)
+        public Task<GetTicketResult?> FindAsync(
+            Guid id,
+            TicketVisibilityScope visibility,
+            CancellationToken cancellationToken)
         {
             CallCount++;
             QueriedId = id;
-            return Task.FromResult(result);
+            var visibleResult = result is not null &&
+                (visibility.CreatedByUserId is null ||
+                 result.CreatedByUserId == visibility.CreatedByUserId)
+                ? result
+                : null;
+            return Task.FromResult(visibleResult);
         }
     }
 
@@ -510,11 +682,26 @@ public class TicketEndpointsTests
 
         public Task<ListTicketsResult> ListAsync(
             ListTicketsRequest request,
+            TicketVisibilityScope visibility,
             CancellationToken cancellationToken)
         {
             CallCount++;
             Request = request;
-            return Task.FromResult(result);
+            var items = result.Items
+                .Where(item => visibility.CreatedByUserId is null ||
+                    item.CreatedByUserId == visibility.CreatedByUserId)
+                .Where(item => request.CreatedByUserId is null ||
+                    item.CreatedByUserId == request.CreatedByUserId)
+                .ToArray();
+            var totalPages = items.Length == 0
+                ? 0
+                : (int)Math.Ceiling(items.Length / (double)request.PageSize);
+            return Task.FromResult(new ListTicketsResult(
+                items,
+                request.Page,
+                request.PageSize,
+                items.Length,
+                totalPages));
         }
     }
 }

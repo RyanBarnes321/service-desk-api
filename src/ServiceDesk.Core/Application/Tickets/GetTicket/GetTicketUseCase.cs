@@ -1,9 +1,13 @@
+using ServiceDesk.Core.Application.Authentication;
+using ServiceDesk.Core.Application.Tickets;
+
 namespace ServiceDesk.Core.Application.Tickets.GetTicket;
 
 public sealed class GetTicketUseCase(IGetTicketQuery query)
 {
     public Task<GetTicketResult?> ExecuteAsync(
         Guid id,
+        RequestActor actor,
         CancellationToken cancellationToken = default)
     {
         if (id == Guid.Empty)
@@ -12,7 +16,8 @@ public sealed class GetTicketUseCase(IGetTicketQuery query)
         }
 
         cancellationToken.ThrowIfCancellationRequested();
+        var visibility = TicketVisibilityScope.For(actor);
 
-        return query.FindAsync(id, cancellationToken);
+        return query.FindAsync(id, visibility, cancellationToken);
     }
 }

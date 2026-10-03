@@ -1,5 +1,3 @@
-using System.IdentityModel.Tokens.Jwt;
-using System.Security.Claims;
 using ServiceDesk.Api.Contracts.Tickets;
 using ServiceDesk.Api.Security;
 using ServiceDesk.Core.Application.Tickets.CreateTicket;
@@ -27,10 +25,10 @@ public static class TicketEndpoints
     private static async Task<IResult> CreateAsync(
         CreateTicketRequest request,
         CreateTicketUseCase useCase,
-        ClaimsPrincipal user,
+        HttpContext httpContext,
         CancellationToken cancellationToken)
     {
-        if (!TryGetSubject(user, out var userId))
+        if (!RequestActorContext.TryGet(httpContext, out var actor))
         {
             return Results.Forbid();
         }
@@ -42,7 +40,7 @@ public static class TicketEndpoints
                 request.Description,
                 request.Category,
                 request.Priority,
-                userId);
+                actor.UserId);
             var result = await useCase.ExecuteAsync(command, cancellationToken);
             var response = new CreateTicketResponse(
                 result.Id,
@@ -65,11 +63,17 @@ public static class TicketEndpoints
     private static async Task<IResult> GetAsync(
         Guid id,
         GetTicketUseCase useCase,
+        HttpContext httpContext,
         CancellationToken cancellationToken)
     {
+        if (!RequestActorContext.TryGet(httpContext, out var actor))
+        {
+            return Results.Forbid();
+        }
+
         try
         {
-            var result = await useCase.ExecuteAsync(id, cancellationToken);
+            var result = await useCase.ExecuteAsync(id, actor, cancellationToken);
 
             if (result is null)
             {
@@ -100,8 +104,14 @@ public static class TicketEndpoints
     private static async Task<IResult> ListAsync(
         [AsParameters] ListTicketsQueryRequest request,
         ListTicketsUseCase useCase,
+        HttpContext httpContext,
         CancellationToken cancellationToken)
     {
+        if (!RequestActorContext.TryGet(httpContext, out var actor))
+        {
+            return Results.Forbid();
+        }
+
         try
         {
             var applicationRequest = new ListTicketsRequest(
@@ -118,7 +128,7 @@ public static class TicketEndpoints
                 request.PageSize ?? ListTicketsRequest.DefaultPageSize,
                 request.SortField ?? TicketSortField.CreatedAt,
                 request.SortDirection ?? TicketSortDirection.Desc);
-            var result = await useCase.ExecuteAsync(applicationRequest, cancellationToken);
+            var result = await useCase.ExecuteAsync(applicationRequest, actor, cancellationToken);
             var response = new ListTicketsResponse(
                 result.Items.Select(item => new ListTicketResponse(
                     item.Id,
@@ -174,11 +184,4 @@ public static class TicketEndpoints
             "sortDirection";
     }
 
-    private static bool TryGetSubject(ClaimsPrincipal user, out Guid userId)
-    {
-        return Guid.TryParse(
-                user.FindFirst(JwtRegisteredClaimNames.Sub)?.Value,
-                out userId) &&
-            userId != Guid.Empty;
-    }
 }

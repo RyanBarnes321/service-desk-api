@@ -1,9 +1,13 @@
+using ServiceDesk.Core.Application.Authentication;
+using ServiceDesk.Core.Application.Tickets;
+
 namespace ServiceDesk.Core.Application.Tickets.ListTickets;
 
 public sealed class ListTicketsUseCase(IListTicketsQuery query)
 {
     public Task<ListTicketsResult> ExecuteAsync(
         ListTicketsRequest request,
+        RequestActor actor,
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(request);
@@ -17,8 +21,9 @@ public sealed class ListTicketsUseCase(IListTicketsQuery query)
                 ? null
                 : request.Search.Trim()
         };
+        var visibility = TicketVisibilityScope.For(actor);
 
-        return query.ListAsync(normalizedRequest, cancellationToken);
+        return query.ListAsync(normalizedRequest, visibility, cancellationToken);
     }
 
     private static void Validate(ListTicketsRequest request)

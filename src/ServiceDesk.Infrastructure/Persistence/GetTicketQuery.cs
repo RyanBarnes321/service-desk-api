@@ -1,15 +1,26 @@
 using Microsoft.EntityFrameworkCore;
+using ServiceDesk.Core.Application.Tickets;
 using ServiceDesk.Core.Application.Tickets.GetTicket;
 
 namespace ServiceDesk.Infrastructure.Persistence;
 
 public sealed class GetTicketQuery(ServiceDeskDbContext dbContext) : IGetTicketQuery
 {
-    public Task<GetTicketResult?> FindAsync(Guid id, CancellationToken cancellationToken)
+    public Task<GetTicketResult?> FindAsync(
+        Guid id,
+        TicketVisibilityScope visibility,
+        CancellationToken cancellationToken)
     {
-        return dbContext.Tickets
+        var tickets = dbContext.Tickets
             .AsNoTracking()
-            .Where(ticket => ticket.Id == id)
+            .Where(ticket => ticket.Id == id);
+
+        if (visibility.CreatedByUserId is { } createdByUserId)
+        {
+            tickets = tickets.Where(ticket => ticket.CreatedByUserId == createdByUserId);
+        }
+
+        return tickets
             .Select(ticket => new GetTicketResult(
                 ticket.Id,
                 ticket.Title,

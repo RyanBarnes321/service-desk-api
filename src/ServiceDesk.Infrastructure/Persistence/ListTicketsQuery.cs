@@ -1,5 +1,6 @@
 using Microsoft.EntityFrameworkCore;
 using ServiceDesk.Core.Application.Tickets.ListTickets;
+using ServiceDesk.Core.Application.Tickets;
 using ServiceDesk.Core.Entities;
 
 namespace ServiceDesk.Infrastructure.Persistence;
@@ -8,9 +9,15 @@ public sealed class ListTicketsQuery(ServiceDeskDbContext dbContext) : IListTick
 {
     public async Task<ListTicketsResult> ListAsync(
         ListTicketsRequest request,
+        TicketVisibilityScope visibility,
         CancellationToken cancellationToken)
     {
         IQueryable<Ticket> tickets = dbContext.Tickets.AsNoTracking();
+
+        if (visibility.CreatedByUserId is { } visibleCreatorId)
+        {
+            tickets = tickets.Where(ticket => ticket.CreatedByUserId == visibleCreatorId);
+        }
 
         if (request.Status is not null)
         {

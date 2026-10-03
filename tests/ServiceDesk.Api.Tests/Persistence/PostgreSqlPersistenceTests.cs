@@ -1,7 +1,10 @@
 using Microsoft.EntityFrameworkCore;
 using Npgsql;
+using ServiceDesk.Core.Application.Authentication;
 using ServiceDesk.Core.Application.Authentication.Login;
+using ServiceDesk.Core.Application.Tickets.GetTicket;
 using ServiceDesk.Core.Application.Tickets.ListTickets;
+using ServiceDesk.Core.Application.Tickets;
 using ServiceDesk.Core.Security;
 using ServiceDesk.Core.Entities;
 using ServiceDesk.Core.Enums;
@@ -82,7 +85,10 @@ public class PostgreSqlPersistenceTests
                 Assert.NotNull(loginUser);
                 Assert.Equal(user.Id, loginUser.Id);
                 Assert.Equal(user.Email, loginUser.Email);
-                Assert.True(await stateQuery.IsActiveAsync(user.Id, CancellationToken.None));
+                var currentState = await stateQuery.FindAsync(user.Id, CancellationToken.None);
+                Assert.NotNull(currentState);
+                Assert.True(currentState.IsActive);
+                Assert.Equal(user.Role, currentState.Role);
             }
 
             await using (var updateContext = CreateContext())
@@ -94,7 +100,9 @@ public class PostgreSqlPersistenceTests
 
             await using var inactiveContext = CreateContext();
             var inactiveStateQuery = new CurrentUserStateQuery(inactiveContext);
-            Assert.False(await inactiveStateQuery.IsActiveAsync(user.Id, CancellationToken.None));
+            var inactiveState = await inactiveStateQuery.FindAsync(user.Id, CancellationToken.None);
+            Assert.NotNull(inactiveState);
+            Assert.False(inactiveState.IsActive);
         }
         finally
         {
@@ -360,12 +368,19 @@ public class PostgreSqlPersistenceTests
 
             await using var queryContext = CreateContext();
             var query = new ListTicketsQuery(queryContext);
-            var firstDescendingPage = await query.ListAsync(baseRequest, CancellationToken.None);
+            var broadVisibility = TicketVisibilityScope.For(
+                new RequestActor(Guid.NewGuid(), UserRole.Technician));
+            var firstDescendingPage = await query.ListAsync(
+                baseRequest,
+                broadVisibility,
+                CancellationToken.None);
             var secondDescendingPage = await query.ListAsync(
                 baseRequest with { Page = 2 },
+                broadVisibility,
                 CancellationToken.None);
             var firstAscendingPage = await query.ListAsync(
                 baseRequest with { SortDirection = TicketSortDirection.Asc },
+                broadVisibility,
                 CancellationToken.None);
 
             Assert.Equal(expectedNewest, firstDescendingPage.Items.Select(item => item.Id));
@@ -382,6 +397,82 @@ public class PostgreSqlPersistenceTests
             await DeleteTicketsAndUsersAsync(
                 tickets.Select(ticket => ticket.Id),
                 [requester.Id, otherRequester.Id, technician.Id]);
+        }
+    }
+
+    [PostgreSqlIntegrationFact]
+    public async Task TicketReadQueries_EmployeeVisibility_ExcludesOtherCreatorBeforePagingAndCount()
+    {
+        var createdAt = UtcNowAtPostgreSqlPrecision();
+        var employee = User.Create(
+            $"employee-{Guid.NewGuid():N}@example.com",
+            "employee-password-hash",
+            "Morgan",
+            "Taylor",
+            UserRole.Employee,
+            createdAt);
+        var otherEmployee = User.Create(
+            $"employee-{Guid.NewGuid():N}@example.com",
+            "employee-password-hash",
+            "Riley",
+            "Jordan",
+            UserRole.Employee,
+            createdAt);
+        var ownTicket = Ticket.Create(
+            "Employee-owned ticket",
+            "This ticket is visible to its creator.",
+            TicketCategory.Hardware,
+            TicketPriority.Medium,
+            employee.Id,
+            createdAt.AddMinutes(1));
+        var otherTicket = Ticket.Create(
+            "Other employee ticket",
+            "This ticket must not be visible to the first employee.",
+            TicketCategory.Software,
+            TicketPriority.High,
+            otherEmployee.Id,
+            createdAt.AddMinutes(2));
+        var tickets = new[] { ownTicket, otherTicket };
+
+        try
+        {
+            await using (var setupContext = CreateContext())
+            {
+                setupContext.Users.AddRange(employee, otherEmployee);
+                setupContext.Tickets.AddRange(tickets);
+                await setupContext.SaveChangesAsync();
+            }
+
+            await using var queryContext = CreateContext();
+            var visibility = TicketVisibilityScope.For(
+                new RequestActor(employee.Id, UserRole.Employee));
+            var getQuery = new GetTicketQuery(queryContext);
+            var listQuery = new ListTicketsQuery(queryContext);
+
+            var ownResult = await getQuery.FindAsync(
+                ownTicket.Id,
+                visibility,
+                CancellationToken.None);
+            var inaccessibleResult = await getQuery.FindAsync(
+                otherTicket.Id,
+                visibility,
+                CancellationToken.None);
+            var page = await listQuery.ListAsync(
+                new ListTicketsRequest(Page: 1, PageSize: 1),
+                visibility,
+                CancellationToken.None);
+
+            Assert.NotNull(ownResult);
+            Assert.Null(inaccessibleResult);
+            Assert.Equal(1, page.TotalCount);
+            Assert.Equal(1, page.TotalPages);
+            Assert.Equal(ownTicket.Id, Assert.Single(page.Items).Id);
+        }
+        finally
+        {
+            await DeleteTicketsAndUsersAsync(
+                tickets.Select(ticket => ticket.Id),
+                [employee.Id, otherEmployee.Id]);
         }
     }
 
