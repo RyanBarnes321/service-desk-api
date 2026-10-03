@@ -2,6 +2,7 @@ using Microsoft.EntityFrameworkCore;
 using ServiceDesk.Api.Endpoints;
 using ServiceDesk.Core.Application.Tickets.CreateTicket;
 using ServiceDesk.Core.Application.Tickets.GetTicket;
+using ServiceDesk.Core.Application.Tickets.ListTickets;
 using ServiceDesk.Infrastructure.Persistence;
 using System.Text.Json.Serialization;
 
@@ -16,6 +17,8 @@ builder.Services.AddScoped<CreateTicketUseCase>();
 builder.Services.AddScoped<ICreateTicketPersistence, CreateTicketPersistence>();
 builder.Services.AddScoped<GetTicketUseCase>();
 builder.Services.AddScoped<IGetTicketQuery, GetTicketQuery>();
+builder.Services.AddScoped<ListTicketsUseCase>();
+builder.Services.AddScoped<IListTicketsQuery, ListTicketsQuery>();
 builder.Services.AddDbContext<ServiceDeskDbContext>(options =>
     options.UseNpgsql(
         builder.Configuration.GetConnectionString("ServiceDesk"),

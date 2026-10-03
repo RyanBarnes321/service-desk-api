@@ -1,6 +1,7 @@
 using ServiceDesk.Api.Contracts.Tickets;
 using ServiceDesk.Core.Application.Tickets.CreateTicket;
 using ServiceDesk.Core.Application.Tickets.GetTicket;
+using ServiceDesk.Core.Application.Tickets.ListTickets;
 
 namespace ServiceDesk.Api.Endpoints;
 
@@ -13,6 +14,7 @@ public static class TicketEndpoints
         var tickets = endpoints.MapGroup("/api/tickets");
 
         tickets.MapPost("/", CreateAsync);
+        tickets.MapGet("/", ListAsync);
         tickets.MapGet("/{id:guid}", GetAsync).WithName(GetTicketRouteName);
 
         return endpoints;
@@ -86,6 +88,52 @@ public static class TicketEndpoints
         }
     }
 
+    private static async Task<IResult> ListAsync(
+        [AsParameters] ListTicketsQueryRequest request,
+        ListTicketsUseCase useCase,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            var applicationRequest = new ListTicketsRequest(
+                request.Status,
+                request.Priority,
+                request.Category,
+                request.AssignedTechnicianId,
+                // This is client-requested filtering, not user visibility enforcement.
+                request.CreatedByUserId,
+                request.CreatedFrom,
+                request.CreatedTo,
+                request.Search,
+                request.Page ?? ListTicketsRequest.DefaultPage,
+                request.PageSize ?? ListTicketsRequest.DefaultPageSize,
+                request.SortField ?? TicketSortField.CreatedAt,
+                request.SortDirection ?? TicketSortDirection.Desc);
+            var result = await useCase.ExecuteAsync(applicationRequest, cancellationToken);
+            var response = new ListTicketsResponse(
+                result.Items.Select(item => new ListTicketResponse(
+                    item.Id,
+                    item.Title,
+                    item.Category,
+                    item.Priority,
+                    item.Status,
+                    item.CreatedByUserId,
+                    item.AssignedTechnicianId,
+                    item.CreatedAt,
+                    item.UpdatedAt)).ToArray(),
+                result.Page,
+                result.PageSize,
+                result.TotalCount,
+                result.TotalPages);
+
+            return Results.Ok(response);
+        }
+        catch (ArgumentException exception) when (IsListTicketsValidationFailure(exception))
+        {
+            return InvalidRequest(exception);
+        }
+    }
+
     private static IResult InvalidRequest(ArgumentException exception)
     {
         return Results.Problem(
@@ -102,5 +150,18 @@ public static class TicketEndpoints
             "category" or
             "priority" or
             "createdByUserId";
+    }
+
+    private static bool IsListTicketsValidationFailure(ArgumentException exception)
+    {
+        return exception.ParamName is
+            "status" or
+            "priority" or
+            "category" or
+            "page" or
+            "pageSize" or
+            "createdFrom" or
+            "sortField" or
+            "sortDirection";
     }
 }

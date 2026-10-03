@@ -1,5 +1,6 @@
 using Microsoft.EntityFrameworkCore;
 using Npgsql;
+using ServiceDesk.Core.Application.Tickets.ListTickets;
 using ServiceDesk.Core.Entities;
 using ServiceDesk.Core.Enums;
 using ServiceDesk.Infrastructure.Persistence;
@@ -216,6 +217,122 @@ public class PostgreSqlPersistenceTests
         }
     }
 
+    [PostgreSqlIntegrationFact]
+    public async Task ListAsync_CombinedFiltersLiteralSearchSortingAndPagination_ReturnExpectedPage()
+    {
+        var createdAt = UtcNowAtPostgreSqlPrecision();
+        var requester = User.Create(
+            $"requester-{Guid.NewGuid():N}@example.com",
+            "requester-password-hash",
+            "Casey",
+            "Morgan",
+            UserRole.Employee,
+            createdAt);
+        var otherRequester = User.Create(
+            $"requester-{Guid.NewGuid():N}@example.com",
+            "requester-password-hash",
+            "Jamie",
+            "Rivera",
+            UserRole.Employee,
+            createdAt);
+        var technician = User.Create(
+            $"technician-{Guid.NewGuid():N}@example.com",
+            "technician-password-hash",
+            "Taylor",
+            "Lee",
+            UserRole.Technician,
+            createdAt);
+        var oldest = AssignedTicket(
+            "Literal %_\\ Marker in title",
+            "First matching ticket.",
+            TicketCategory.Network,
+            requester.Id,
+            technician.Id,
+            createdAt.AddMinutes(1));
+        var newestA = AssignedTicket(
+            "Second matching ticket",
+            "LITERAL %_\\ MARKER in description.",
+            TicketCategory.Network,
+            requester.Id,
+            technician.Id,
+            createdAt.AddMinutes(2));
+        var newestB = AssignedTicket(
+            "Another literal %_\\ marker",
+            "Third matching ticket.",
+            TicketCategory.Network,
+            requester.Id,
+            technician.Id,
+            createdAt.AddMinutes(2));
+        var wildcardDecoy = AssignedTicket(
+            "Literal abcX\\ Marker should not match",
+            "Wildcard decoy.",
+            TicketCategory.Network,
+            requester.Id,
+            technician.Id,
+            createdAt.AddMinutes(2));
+        var filterDecoy = AssignedTicket(
+            "Literal %_\\ Marker wrong category",
+            "Filter decoy.",
+            TicketCategory.Software,
+            otherRequester.Id,
+            technician.Id,
+            createdAt.AddMinutes(2));
+        var tickets = new[] { oldest, newestA, newestB, wildcardDecoy, filterDecoy };
+
+        try
+        {
+            await using (var setupContext = CreateContext())
+            {
+                setupContext.Users.AddRange(requester, otherRequester, technician);
+                setupContext.Tickets.AddRange(tickets);
+                await setupContext.SaveChangesAsync();
+            }
+
+            var baseRequest = new ListTicketsRequest(
+                TicketStatus.Assigned,
+                TicketPriority.High,
+                TicketCategory.Network,
+                technician.Id,
+                requester.Id,
+                oldest.CreatedAt,
+                newestA.CreatedAt,
+                @"literal %_\ marker",
+                1,
+                2,
+                TicketSortField.CreatedAt,
+                TicketSortDirection.Desc);
+            var expectedNewest = new[] { newestA, newestB }
+                .OrderByDescending(ticket => ticket.Id)
+                .Select(ticket => ticket.Id)
+                .ToArray();
+
+            await using var queryContext = CreateContext();
+            var query = new ListTicketsQuery(queryContext);
+            var firstDescendingPage = await query.ListAsync(baseRequest, CancellationToken.None);
+            var secondDescendingPage = await query.ListAsync(
+                baseRequest with { Page = 2 },
+                CancellationToken.None);
+            var firstAscendingPage = await query.ListAsync(
+                baseRequest with { SortDirection = TicketSortDirection.Asc },
+                CancellationToken.None);
+
+            Assert.Equal(expectedNewest, firstDescendingPage.Items.Select(item => item.Id));
+            Assert.Equal(3, firstDescendingPage.TotalCount);
+            Assert.Equal(2, firstDescendingPage.TotalPages);
+            Assert.Equal(oldest.Id, Assert.Single(secondDescendingPage.Items).Id);
+            Assert.Equal(oldest.Id, firstAscendingPage.Items[0].Id);
+            Assert.Equal(
+                expectedNewest.OrderBy(id => id).First(),
+                firstAscendingPage.Items[1].Id);
+        }
+        finally
+        {
+            await DeleteTicketsAndUsersAsync(
+                tickets.Select(ticket => ticket.Id),
+                [requester.Id, otherRequester.Id, technician.Id]);
+        }
+    }
+
     private static ServiceDeskDbContext CreateContext()
     {
         var options = new DbContextOptionsBuilder<ServiceDeskDbContext>()
@@ -223,6 +340,25 @@ public class PostgreSqlPersistenceTests
             .Options;
 
         return new ServiceDeskDbContext(options);
+    }
+
+    private static Ticket AssignedTicket(
+        string title,
+        string description,
+        TicketCategory category,
+        Guid requesterId,
+        Guid technicianId,
+        DateTimeOffset createdAt)
+    {
+        var ticket = Ticket.Create(
+            title,
+            description,
+            category,
+            TicketPriority.High,
+            requesterId,
+            createdAt);
+        ticket.Assign(technicianId, createdAt);
+        return ticket;
     }
 
     private static DateTimeOffset UtcNowAtPostgreSqlPrecision()
@@ -282,5 +418,27 @@ public class PostgreSqlPersistenceTests
             $"DELETE FROM tickets WHERE id = {ticketId}");
         await context.Database.ExecuteSqlInterpolatedAsync(
             $"DELETE FROM users WHERE id IN ({requesterId}, {technicianId})");
+    }
+
+    private static async Task DeleteTicketsAndUsersAsync(
+        IEnumerable<Guid> ticketIds,
+        IEnumerable<Guid> userIds)
+    {
+        await using var context = CreateContext();
+
+        foreach (var ticketId in ticketIds)
+        {
+            await context.Database.ExecuteSqlInterpolatedAsync(
+                $"DELETE FROM ticket_comments WHERE ticket_id = {ticketId}");
+            await context.Database.ExecuteSqlInterpolatedAsync(
+                $"DELETE FROM ticket_history WHERE ticket_id = {ticketId}");
+            await context.Database.ExecuteSqlInterpolatedAsync(
+                $"DELETE FROM tickets WHERE id = {ticketId}");
+        }
+
+        foreach (var userId in userIds)
+        {
+            await context.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM users WHERE id = {userId}");
+        }
     }
 }
