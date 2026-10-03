@@ -37,13 +37,17 @@ public class CreateTicketUseCaseTests
     public async Task ExecuteAsync_ValidCommand_DelegatesTicketAndCancellationTokenExactlyOnce()
     {
         var persistence = new RecordingPersistence();
-        var useCase = CreateUseCase(persistence);
+        var timeProvider = new RecordingTimeProvider(CurrentTime);
+        var useCase = new CreateTicketUseCase(persistence, timeProvider);
         using var cancellationSource = new CancellationTokenSource();
         var command = ValidCommand();
 
         var result = await useCase.ExecuteAsync(command, cancellationSource.Token);
 
-        var persistedTicket = Assert.Single(persistence.PersistedTickets);
+        Assert.Equal(1, persistence.CallCount);
+        Assert.Equal(1, timeProvider.GetUtcNowCallCount);
+        var persistedTicket = Assert.IsType<Ticket>(persistence.PersistedTicket);
+        var persistedHistory = Assert.IsType<TicketHistory>(persistence.PersistedHistory);
         Assert.Equal(result.Id, persistedTicket.Id);
         Assert.Equal(command.Title, persistedTicket.Title);
         Assert.Equal(command.Description, persistedTicket.Description);
@@ -51,6 +55,13 @@ public class CreateTicketUseCaseTests
         Assert.Equal(command.Priority, persistedTicket.Priority);
         Assert.Equal(command.CreatedByUserId, persistedTicket.CreatedByUserId);
         Assert.Equal(CurrentTime, persistedTicket.CreatedAt);
+        Assert.NotEqual(Guid.Empty, persistedHistory.Id);
+        Assert.Equal(persistedTicket.Id, persistedHistory.TicketId);
+        Assert.Equal<Guid?>(command.CreatedByUserId, persistedHistory.PerformedByUserId);
+        Assert.Equal(TicketHistoryEventType.Created, persistedHistory.EventType);
+        Assert.Null(persistedHistory.OldValue);
+        Assert.Null(persistedHistory.NewValue);
+        Assert.Equal(persistedTicket.CreatedAt, persistedHistory.CreatedAt);
         Assert.Equal(cancellationSource.Token, persistence.CancellationToken);
     }
 
@@ -64,7 +75,9 @@ public class CreateTicketUseCaseTests
         var exception = await Assert.ThrowsAsync<ArgumentException>(() => useCase.ExecuteAsync(command));
 
         Assert.Equal("title", exception.ParamName);
-        Assert.Empty(persistence.PersistedTickets);
+        Assert.Equal(0, persistence.CallCount);
+        Assert.Null(persistence.PersistedTicket);
+        Assert.Null(persistence.PersistedHistory);
     }
 
     [Fact]
@@ -78,12 +91,14 @@ public class CreateTicketUseCaseTests
         await Assert.ThrowsAnyAsync<OperationCanceledException>(
             () => useCase.ExecuteAsync(ValidCommand(), cancellationSource.Token));
 
-        Assert.Empty(persistence.PersistedTickets);
+        Assert.Equal(0, persistence.CallCount);
+        Assert.Null(persistence.PersistedTicket);
+        Assert.Null(persistence.PersistedHistory);
     }
 
     private static CreateTicketUseCase CreateUseCase(ICreateTicketPersistence persistence)
     {
-        return new CreateTicketUseCase(persistence, new FixedTimeProvider(CurrentTime));
+        return new CreateTicketUseCase(persistence, new RecordingTimeProvider(CurrentTime));
     }
 
     private static CreateTicketCommand ValidCommand()
@@ -98,20 +113,35 @@ public class CreateTicketUseCaseTests
 
     private sealed class RecordingPersistence : ICreateTicketPersistence
     {
-        public List<Ticket> PersistedTickets { get; } = [];
+        public int CallCount { get; private set; }
+
+        public Ticket? PersistedTicket { get; private set; }
+
+        public TicketHistory? PersistedHistory { get; private set; }
 
         public CancellationToken CancellationToken { get; private set; }
 
-        public Task PersistAsync(Ticket ticket, CancellationToken cancellationToken)
+        public Task PersistAsync(
+            Ticket ticket,
+            TicketHistory history,
+            CancellationToken cancellationToken)
         {
-            PersistedTickets.Add(ticket);
+            CallCount++;
+            PersistedTicket = ticket;
+            PersistedHistory = history;
             CancellationToken = cancellationToken;
             return Task.CompletedTask;
         }
     }
 
-    private sealed class FixedTimeProvider(DateTimeOffset currentTime) : TimeProvider
+    private sealed class RecordingTimeProvider(DateTimeOffset currentTime) : TimeProvider
     {
-        public override DateTimeOffset GetUtcNow() => currentTime;
+        public int GetUtcNowCallCount { get; private set; }
+
+        public override DateTimeOffset GetUtcNow()
+        {
+            GetUtcNowCallCount++;
+            return currentTime;
+        }
     }
 }

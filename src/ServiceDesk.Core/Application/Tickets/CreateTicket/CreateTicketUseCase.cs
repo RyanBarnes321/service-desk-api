@@ -1,4 +1,5 @@
 using ServiceDesk.Core.Entities;
+using ServiceDesk.Core.Enums;
 
 namespace ServiceDesk.Core.Application.Tickets.CreateTicket;
 
@@ -13,15 +14,23 @@ public sealed class CreateTicketUseCase(
         ArgumentNullException.ThrowIfNull(command);
         cancellationToken.ThrowIfCancellationRequested();
 
+        var createdAt = timeProvider.GetUtcNow();
         var ticket = Ticket.Create(
             command.Title,
             command.Description,
             command.Category,
             command.Priority,
             command.CreatedByUserId,
-            timeProvider.GetUtcNow());
+            createdAt);
+        var history = TicketHistory.Create(
+            ticket.Id,
+            command.CreatedByUserId,
+            TicketHistoryEventType.Created,
+            null,
+            null,
+            createdAt);
 
-        await persistence.PersistAsync(ticket, cancellationToken);
+        await persistence.PersistAsync(ticket, history, cancellationToken);
 
         return CreateTicketResult.FromTicket(ticket);
     }

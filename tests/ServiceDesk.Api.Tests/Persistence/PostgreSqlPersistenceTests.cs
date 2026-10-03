@@ -50,6 +50,67 @@ public class PostgreSqlPersistenceTests
     }
 
     [PostgreSqlIntegrationFact]
+    public async Task PersistAsync_ValidTicketAndCreatedHistory_PersistsBoth()
+    {
+        var createdAt = UtcNowAtPostgreSqlPrecision();
+        var requester = User.Create(
+            $"requester-{Guid.NewGuid():N}@example.com",
+            "requester-password-hash",
+            "Jordan",
+            "Quinn",
+            UserRole.Employee,
+            createdAt);
+        var ticket = Ticket.Create(
+            "Cannot connect to VPN",
+            "The VPN client times out during connection.",
+            TicketCategory.Network,
+            TicketPriority.High,
+            requester.Id,
+            createdAt);
+        var history = TicketHistory.Create(
+            ticket.Id,
+            requester.Id,
+            TicketHistoryEventType.Created,
+            null,
+            null,
+            createdAt);
+
+        try
+        {
+            await using (var setupContext = CreateContext())
+            {
+                setupContext.Users.Add(requester);
+                await setupContext.SaveChangesAsync();
+            }
+
+            await using (var writeContext = CreateContext())
+            {
+                var persistence = new CreateTicketPersistence(writeContext);
+                await persistence.PersistAsync(ticket, history, CancellationToken.None);
+            }
+
+            await using var readContext = CreateContext();
+            var reloadedTicket = await readContext.Tickets
+                .SingleAsync(candidate => candidate.Id == ticket.Id);
+            var reloadedHistory = await readContext.TicketHistory
+                .SingleAsync(candidate => candidate.Id == history.Id);
+
+            Assert.Equal(ticket.Id, reloadedTicket.Id);
+            Assert.Equal(ticket.CreatedAt, reloadedTicket.CreatedAt);
+            Assert.Equal(ticket.Id, reloadedHistory.TicketId);
+            Assert.Equal<Guid?>(requester.Id, reloadedHistory.PerformedByUserId);
+            Assert.Equal(TicketHistoryEventType.Created, reloadedHistory.EventType);
+            Assert.Null(reloadedHistory.OldValue);
+            Assert.Null(reloadedHistory.NewValue);
+            Assert.Equal(ticket.CreatedAt, reloadedHistory.CreatedAt);
+        }
+        finally
+        {
+            await DeleteTicketGraphAsync(ticket.Id, requester.Id, requester.Id);
+        }
+    }
+
+    [PostgreSqlIntegrationFact]
     public async Task TicketGraph_RoundTripsStringsRelationshipsAndRestrictiveForeignKey()
     {
         var createdAt = UtcNowAtPostgreSqlPrecision();

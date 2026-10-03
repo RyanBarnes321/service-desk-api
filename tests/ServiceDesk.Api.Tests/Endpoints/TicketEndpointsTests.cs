@@ -214,7 +214,10 @@ public class TicketEndpointsTests
     {
         public int CallCount { get; private set; }
 
-        public Task PersistAsync(Ticket ticket, CancellationToken cancellationToken)
+        public Task PersistAsync(
+            Ticket ticket,
+            TicketHistory history,
+            CancellationToken cancellationToken)
         {
             CallCount++;
 

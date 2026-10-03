@@ -4,5 +4,8 @@ namespace ServiceDesk.Core.Application.Tickets.CreateTicket;
 
 public interface ICreateTicketPersistence
 {
-    Task PersistAsync(Ticket ticket, CancellationToken cancellationToken);
+    Task PersistAsync(
+        Ticket ticket,
+        TicketHistory history,
+        CancellationToken cancellationToken);
 }

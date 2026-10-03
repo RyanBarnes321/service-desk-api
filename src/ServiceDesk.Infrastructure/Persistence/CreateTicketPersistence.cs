@@ -5,9 +5,13 @@ namespace ServiceDesk.Infrastructure.Persistence;
 
 public sealed class CreateTicketPersistence(ServiceDeskDbContext dbContext) : ICreateTicketPersistence
 {
-    public async Task PersistAsync(Ticket ticket, CancellationToken cancellationToken)
+    public async Task PersistAsync(
+        Ticket ticket,
+        TicketHistory history,
+        CancellationToken cancellationToken)
     {
-        await dbContext.Tickets.AddAsync(ticket, cancellationToken);
+        dbContext.Tickets.Add(ticket);
+        dbContext.TicketHistory.Add(history);
         await dbContext.SaveChangesAsync(cancellationToken);
     }
 }
