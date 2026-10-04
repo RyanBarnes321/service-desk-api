@@ -6,6 +6,7 @@ using ServiceDesk.Core.Application.Tickets.GetTicket;
 using ServiceDesk.Core.Application.Tickets.ListTickets;
 using ServiceDesk.Core.Application.Tickets;
 using ServiceDesk.Core.Application.Tickets.Assignment;
+using ServiceDesk.Core.Application.Tickets.TechnicalOperations;
 using ServiceDesk.Core.Security;
 using ServiceDesk.Core.Entities;
 using ServiceDesk.Core.Enums;
@@ -610,6 +611,80 @@ public class PostgreSqlPersistenceTests
         }
     }
 
+    [PostgreSqlIntegrationFact]
+    public async Task TechnicalOperation_StartWork_PersistsStateHistoryAndVersionIncrement()
+    {
+        var createdAt = UtcNowAtPostgreSqlPrecision();
+        var occurredAt = createdAt.AddMinutes(2);
+        var requester = User.Create(
+            $"requester-{Guid.NewGuid():N}@example.com",
+            "requester-password-hash",
+            "Alex",
+            "Morgan",
+            UserRole.Employee,
+            createdAt);
+        var technician = User.Create(
+            $"technician-{Guid.NewGuid():N}@example.com",
+            "technician-password-hash",
+            "Taylor",
+            "Rivera",
+            UserRole.Technician,
+            createdAt);
+        var ticket = Ticket.Create(
+            "Start technical work",
+            "Verify the technical-operation persistence path.",
+            TicketCategory.Hardware,
+            TicketPriority.Medium,
+            requester.Id,
+            createdAt);
+        ticket.Assign(technician.Id, createdAt.AddMinutes(1));
+
+        try
+        {
+            await using (var setupContext = CreateContext())
+            {
+                setupContext.Users.AddRange(requester, technician);
+                setupContext.Tickets.Add(ticket);
+                await setupContext.SaveChangesAsync();
+            }
+
+            await using (var mutationContext = CreateContext())
+            {
+                var persistence = new TicketAssignmentPersistence(mutationContext);
+                var useCase = new TicketTechnicalOperationsUseCase(
+                    persistence,
+                    new FixedTimeProvider(occurredAt));
+
+                var result = await useCase.StartWorkAsync(
+                    ticket.Id,
+                    new RequestActor(technician.Id, UserRole.Technician));
+
+                Assert.Equal(TicketTechnicalOperationOutcome.Success, result.Outcome);
+            }
+
+            await using var verificationContext = CreateContext();
+            var storedTicket = await verificationContext.Tickets
+                .SingleAsync(candidate => candidate.Id == ticket.Id);
+            var history = await verificationContext.TicketHistory
+                .SingleAsync(candidate => candidate.TicketId == ticket.Id);
+
+            Assert.Equal(TicketStatus.InProgress, storedTicket.Status);
+            Assert.Equal(occurredAt, storedTicket.UpdatedAt);
+            Assert.Equal(1L, verificationContext.Entry(storedTicket).Property<long>("Version").CurrentValue);
+            Assert.Equal(TicketHistoryEventType.StatusChanged, history.EventType);
+            Assert.Equal("Assigned", history.OldValue);
+            Assert.Equal("InProgress", history.NewValue);
+            Assert.Equal<Guid?>(technician.Id, history.PerformedByUserId);
+            Assert.Equal(occurredAt, history.CreatedAt);
+        }
+        finally
+        {
+            await DeleteTicketsAndUsersAsync(
+                [ticket.Id],
+                [requester.Id, technician.Id]);
+        }
+    }
+
     private static ServiceDeskDbContext CreateContext()
     {
         var options = new DbContextOptionsBuilder<ServiceDeskDbContext>()
@@ -661,6 +736,11 @@ public class PostgreSqlPersistenceTests
                 TicketStatus.Assigned.ToString(),
                 occurredAt)
         ];
+    }
+
+    private sealed class FixedTimeProvider(DateTimeOffset utcNow) : TimeProvider
+    {
+        public override DateTimeOffset GetUtcNow() => utcNow;
     }
 
     private static DateTimeOffset UtcNowAtPostgreSqlPrecision()

@@ -297,8 +297,23 @@ public class TicketTests
         Assert.ThrowsAny<ArgumentException>(() => ticket.Resolve(summary!, NextTime(ticket)));
     }
 
+    [Fact]
+    public void Resolve_WithOverLimitSummary_ThrowsArgumentException()
+    {
+        var ticket = CreateTicketInStatus(TicketStatus.InProgress);
+
+        var exception = Assert.Throws<ArgumentException>(() => ticket.Resolve(
+            new string('x', Ticket.MaximumResolutionSummaryLength + 1),
+            NextTime(ticket)));
+
+        Assert.Equal("resolutionSummary", exception.ParamName);
+        Assert.Equal(TicketStatus.InProgress, ticket.Status);
+        Assert.Null(ticket.ResolutionSummary);
+    }
+
     [Theory]
     [InlineData(TicketStatus.Assigned)]
+    [InlineData(TicketStatus.Waiting)]
     [InlineData(TicketStatus.Resolved)]
     public void Resolve_FromInvalidStatus_ThrowsInvalidOperationException(TicketStatus status)
     {

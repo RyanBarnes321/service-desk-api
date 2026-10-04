@@ -4,6 +4,8 @@ namespace ServiceDesk.Core.Entities;
 
 public class Ticket
 {
+    public const int MaximumResolutionSummaryLength = 5_000;
+
     private Ticket(
         Guid id,
         string title,
@@ -163,6 +165,14 @@ public class Ticket
     public void Resolve(string resolutionSummary, DateTimeOffset occurredAt)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(resolutionSummary);
+
+        if (resolutionSummary.Length > MaximumResolutionSummaryLength)
+        {
+            throw new ArgumentException(
+                $"Resolution summary cannot exceed {MaximumResolutionSummaryLength} characters.",
+                nameof(resolutionSummary));
+        }
+
         EnsureChronology(occurredAt);
         EnsureStatus(TicketStatus.InProgress, nameof(Resolve));
 

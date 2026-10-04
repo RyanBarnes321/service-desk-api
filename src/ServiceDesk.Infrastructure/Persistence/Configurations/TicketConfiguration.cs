@@ -51,7 +51,7 @@ public class TicketConfiguration : IEntityTypeConfiguration<Ticket>
 
         builder.Property(ticket => ticket.ResolutionSummary)
             .HasColumnName("resolution_summary")
-            .HasMaxLength(5_000);
+            .HasMaxLength(Ticket.MaximumResolutionSummaryLength);
 
         builder.Property(ticket => ticket.CreatedAt)
             .HasColumnName("created_at")

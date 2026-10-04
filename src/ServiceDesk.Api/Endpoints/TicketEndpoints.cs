@@ -4,6 +4,7 @@ using ServiceDesk.Core.Application.Tickets.Assignment;
 using ServiceDesk.Core.Application.Tickets.CreateTicket;
 using ServiceDesk.Core.Application.Tickets.GetTicket;
 using ServiceDesk.Core.Application.Tickets.ListTickets;
+using ServiceDesk.Core.Application.Tickets.TechnicalOperations;
 
 namespace ServiceDesk.Api.Endpoints;
 
@@ -21,6 +22,11 @@ public static class TicketEndpoints
         tickets.MapPost("/{id:guid}/claim", ClaimAsync);
         tickets.MapPut("/{id:guid}/assignment", AssignAsync);
         tickets.MapDelete("/{id:guid}/assignment", UnassignAsync);
+        tickets.MapPost("/{id:guid}/start", StartWorkAsync);
+        tickets.MapPost("/{id:guid}/wait", WaitAsync);
+        tickets.MapPost("/{id:guid}/resume", ResumeAsync);
+        tickets.MapPost("/{id:guid}/resolve", ResolveAsync);
+        tickets.MapPut("/{id:guid}/priority", ChangePriorityAsync);
         tickets.RequireAuthorization(ActiveUserPolicy.Name);
 
         return endpoints;
@@ -241,6 +247,126 @@ public static class TicketEndpoints
         return Results.Problem(
             statusCode: StatusCodes.Status409Conflict,
             title: "Ticket assignment conflict",
+            detail: detail);
+    }
+
+    private static Task<IResult> StartWorkAsync(
+        Guid id,
+        TicketTechnicalOperationsUseCase useCase,
+        HttpContext httpContext,
+        CancellationToken cancellationToken)
+    {
+        return ExecuteTechnicalOperationAsync(
+            httpContext,
+            actor => useCase.StartWorkAsync(id, actor, cancellationToken));
+    }
+
+    private static Task<IResult> WaitAsync(
+        Guid id,
+        TicketTechnicalOperationsUseCase useCase,
+        HttpContext httpContext,
+        CancellationToken cancellationToken)
+    {
+        return ExecuteTechnicalOperationAsync(
+            httpContext,
+            actor => useCase.WaitAsync(id, actor, cancellationToken));
+    }
+
+    private static Task<IResult> ResumeAsync(
+        Guid id,
+        TicketTechnicalOperationsUseCase useCase,
+        HttpContext httpContext,
+        CancellationToken cancellationToken)
+    {
+        return ExecuteTechnicalOperationAsync(
+            httpContext,
+            actor => useCase.ResumeAsync(id, actor, cancellationToken));
+    }
+
+    private static Task<IResult> ResolveAsync(
+        Guid id,
+        ResolveTicketRequest request,
+        TicketTechnicalOperationsUseCase useCase,
+        HttpContext httpContext,
+        CancellationToken cancellationToken)
+    {
+        return ExecuteTechnicalOperationAsync(
+            httpContext,
+            actor => useCase.ResolveAsync(
+                id,
+                request.ResolutionSummary,
+                actor,
+                cancellationToken));
+    }
+
+    private static Task<IResult> ChangePriorityAsync(
+        Guid id,
+        ChangeTicketPriorityRequest request,
+        TicketTechnicalOperationsUseCase useCase,
+        HttpContext httpContext,
+        CancellationToken cancellationToken)
+    {
+        return ExecuteTechnicalOperationAsync(
+            httpContext,
+            actor => useCase.ChangePriorityAsync(
+                id,
+                request.Priority,
+                actor,
+                cancellationToken));
+    }
+
+    private static async Task<IResult> ExecuteTechnicalOperationAsync(
+        HttpContext httpContext,
+        Func<ServiceDesk.Core.Application.Authentication.RequestActor,
+            Task<TicketTechnicalOperationResult>> execute)
+    {
+        if (!RequestActorContext.TryGet(httpContext, out var actor))
+        {
+            return Results.Forbid();
+        }
+
+        TicketTechnicalOperationResult result;
+        try
+        {
+            result = await execute(actor);
+        }
+        catch (TicketTechnicalOperationValidationException exception)
+        {
+            return InvalidRequest(exception);
+        }
+
+        return result.Outcome switch
+        {
+            TicketTechnicalOperationOutcome.Success => Results.Ok(
+                ToTechnicalResponse(result.Ticket!)),
+            TicketTechnicalOperationOutcome.Forbidden => Results.Forbid(),
+            TicketTechnicalOperationOutcome.TicketNotFound => Results.NotFound(),
+            TicketTechnicalOperationOutcome.InvalidState => TechnicalOperationConflict(
+                "The ticket cannot perform this operation in its current state."),
+            TicketTechnicalOperationOutcome.ConcurrencyConflict => TechnicalOperationConflict(
+                "The ticket was changed by another request. Refresh and try again."),
+            _ => throw new InvalidOperationException("Unknown ticket technical-operation outcome.")
+        };
+    }
+
+    private static TicketTechnicalOperationResponse ToTechnicalResponse(
+        TicketTechnicalOperationDetails ticket)
+    {
+        return new TicketTechnicalOperationResponse(
+            ticket.Id,
+            ticket.Status,
+            ticket.Priority,
+            ticket.AssignedTechnicianId,
+            ticket.ResolutionSummary,
+            ticket.UpdatedAt,
+            ticket.ResolvedAt);
+    }
+
+    private static IResult TechnicalOperationConflict(string detail)
+    {
+        return Results.Problem(
+            statusCode: StatusCodes.Status409Conflict,
+            title: "Ticket operation conflict",
             detail: detail);
     }
 

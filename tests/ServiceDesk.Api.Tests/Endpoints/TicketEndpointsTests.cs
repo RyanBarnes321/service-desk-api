@@ -886,6 +886,439 @@ public class TicketEndpointsTests
         Assert.Equal(HttpStatusCode.Unauthorized, response.StatusCode);
     }
 
+    [Theory]
+    [InlineData("POST", "/api/tickets/11111111-1111-1111-1111-111111111111/start")]
+    [InlineData("POST", "/api/tickets/11111111-1111-1111-1111-111111111111/wait")]
+    [InlineData("POST", "/api/tickets/11111111-1111-1111-1111-111111111111/resume")]
+    [InlineData("POST", "/api/tickets/11111111-1111-1111-1111-111111111111/resolve")]
+    [InlineData("PUT", "/api/tickets/11111111-1111-1111-1111-111111111111/priority")]
+    public async Task TechnicalRoute_AnonymousRequest_ReturnsUnauthorized(string method, string path)
+    {
+        await using var factory = new TicketApiFactory();
+        using var client = factory.CreateHttpsClient(authenticated: false);
+        using var request = new HttpRequestMessage(new HttpMethod(method), path);
+        request.Content = path.EndsWith("/resolve", StringComparison.Ordinal)
+            ? JsonContent.Create(new ResolveTicketRequest("Resolved."))
+            : path.EndsWith("/priority", StringComparison.Ordinal)
+                ? JsonContent.Create(new ChangeTicketPriorityRequest(TicketPriority.High))
+                : null;
+
+        var response = await client.SendAsync(request);
+
+        Assert.Equal(HttpStatusCode.Unauthorized, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task TechnicalRoute_InvalidToken_ReturnsUnauthorizedBeforeCurrentUserLookup()
+    {
+        await using var factory = new TicketApiFactory();
+        using var client = factory.CreateHttpsClient(
+            accessToken: TestJwt.Create(
+                factory.UserId,
+                signingKey: "different-test-only-signing-key-that-is-also-at-least-sixty-four-characters"));
+
+        var response = await client.PostAsync($"/api/tickets/{Guid.NewGuid()}/start", null);
+
+        Assert.Equal(HttpStatusCode.Unauthorized, response.StatusCode);
+        Assert.Equal(0, factory.UserState.CallCount);
+    }
+
+    [Theory]
+    [InlineData(false, true)]
+    [InlineData(true, false)]
+    public async Task TechnicalRoute_InactiveOrMissingCurrentUser_ReturnsForbidden(
+        bool active,
+        bool exists)
+    {
+        var ticket = TechnicalTicket(Guid.NewGuid(), TicketStatus.Assigned);
+        await using var factory = new TicketApiFactory(
+            isCurrentUserActive: active,
+            currentUserExists: exists,
+            persistedRole: UserRole.Technician,
+            currentUserId: ticket.AssignedTechnicianId,
+            assignmentTicket: ticket);
+        using var client = factory.CreateHttpsClient();
+
+        var response = await client.PostAsync($"/api/tickets/{ticket.Id}/start", null);
+
+        Assert.Equal(HttpStatusCode.Forbidden, response.StatusCode);
+        Assert.Equal(0, factory.AssignmentPersistence.FindCallCount);
+    }
+
+    [Theory]
+    [InlineData(UserRole.Employee)]
+    [InlineData(UserRole.Administrator)]
+    public async Task StartWork_NonTechnicianPersistedRole_ReturnsForbidden(UserRole role)
+    {
+        var userId = Guid.NewGuid();
+        var ticket = TechnicalTicket(userId, TicketStatus.Assigned);
+        await using var factory = new TicketApiFactory(
+            persistedRole: role,
+            currentUserId: userId,
+            assignmentTicket: ticket);
+        using var client = factory.CreateHttpsClient();
+
+        var response = await client.PostAsync($"/api/tickets/{ticket.Id}/start", null);
+
+        Assert.Equal(HttpStatusCode.Forbidden, response.StatusCode);
+        Assert.Equal(0, factory.AssignmentPersistence.FindCallCount);
+    }
+
+    [Fact]
+    public async Task StartWork_DifferentTechnicianAndUnassignedTicket_ReturnForbidden()
+    {
+        var actorId = Guid.NewGuid();
+        var otherTicket = TechnicalTicket(Guid.NewGuid(), TicketStatus.Assigned);
+        await using var otherFactory = new TicketApiFactory(
+            persistedRole: UserRole.Technician,
+            currentUserId: actorId,
+            assignmentTicket: otherTicket);
+        using var otherClient = otherFactory.CreateHttpsClient();
+
+        var otherResponse = await otherClient.PostAsync(
+            $"/api/tickets/{otherTicket.Id}/start",
+            null);
+
+        var unassignedTicket = AssignmentTicket();
+        await using var unassignedFactory = new TicketApiFactory(
+            persistedRole: UserRole.Technician,
+            currentUserId: actorId,
+            assignmentTicket: unassignedTicket);
+        using var unassignedClient = unassignedFactory.CreateHttpsClient();
+        var unassignedResponse = await unassignedClient.PostAsync(
+            $"/api/tickets/{unassignedTicket.Id}/start",
+            null);
+
+        Assert.Equal(HttpStatusCode.Forbidden, otherResponse.StatusCode);
+        Assert.Equal(HttpStatusCode.Forbidden, unassignedResponse.StatusCode);
+        Assert.Equal(0, otherFactory.AssignmentPersistence.PersistCallCount);
+        Assert.Equal(0, unassignedFactory.AssignmentPersistence.PersistCallCount);
+    }
+
+    [Theory]
+    [InlineData("start", TicketStatus.Assigned, TicketStatus.InProgress)]
+    [InlineData("wait", TicketStatus.InProgress, TicketStatus.Waiting)]
+    [InlineData("resume", TicketStatus.Waiting, TicketStatus.InProgress)]
+    public async Task StatusTechnicalOperation_ValidTransition_ReturnsOk(
+        string operation,
+        TicketStatus source,
+        TicketStatus expected)
+    {
+        var userId = Guid.NewGuid();
+        var ticket = TechnicalTicket(userId, source);
+        await using var factory = new TicketApiFactory(
+            persistedRole: UserRole.Technician,
+            currentUserId: userId,
+            assignmentTicket: ticket);
+        using var client = factory.CreateHttpsClient();
+
+        var response = await client.PostAsync($"/api/tickets/{ticket.Id}/{operation}", null);
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        var body = await response.Content.ReadFromJsonAsync<TicketTechnicalOperationResponse>(JsonOptions);
+        Assert.NotNull(body);
+        Assert.Equal(ticket.Id, body.Id);
+        Assert.Equal(expected, body.Status);
+        Assert.Equal(userId, body.AssignedTechnicianId);
+        Assert.Equal(1, factory.AssignmentPersistence.PersistCallCount);
+    }
+
+    [Theory]
+    [InlineData("start", TicketStatus.InProgress)]
+    [InlineData("wait", TicketStatus.Assigned)]
+    [InlineData("resume", TicketStatus.InProgress)]
+    public async Task StatusTechnicalOperation_InvalidTransition_ReturnsConflict(
+        string operation,
+        TicketStatus source)
+    {
+        var userId = Guid.NewGuid();
+        var ticket = TechnicalTicket(userId, source);
+        await using var factory = new TicketApiFactory(
+            persistedRole: UserRole.Technician,
+            currentUserId: userId,
+            assignmentTicket: ticket);
+        using var client = factory.CreateHttpsClient();
+
+        var response = await client.PostAsync($"/api/tickets/{ticket.Id}/{operation}", null);
+
+        Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
+        var problem = await response.Content.ReadFromJsonAsync<ProblemDetails>();
+        Assert.Equal("Ticket operation conflict", problem?.Title);
+    }
+
+    [Theory]
+    [InlineData("start")]
+    [InlineData("wait")]
+    [InlineData("resume")]
+    public async Task StatusTechnicalOperation_MissingTicket_ReturnsNotFound(string operation)
+    {
+        await using var factory = new TicketApiFactory(persistedRole: UserRole.Technician);
+        using var client = factory.CreateHttpsClient();
+
+        var response = await client.PostAsync($"/api/tickets/{Guid.NewGuid()}/{operation}", null);
+
+        Assert.Equal(HttpStatusCode.NotFound, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task Resolve_ValidRequest_ReturnsResolvedResponse()
+    {
+        var userId = Guid.NewGuid();
+        var ticket = TechnicalTicket(userId, TicketStatus.InProgress);
+        await using var factory = new TicketApiFactory(
+            persistedRole: UserRole.Technician,
+            currentUserId: userId,
+            assignmentTicket: ticket);
+        using var client = factory.CreateHttpsClient();
+        const string summary = "Replaced the failed adapter and verified connectivity.";
+
+        var response = await client.PostAsJsonAsync(
+            $"/api/tickets/{ticket.Id}/resolve",
+            new ResolveTicketRequest(summary));
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        var body = await response.Content.ReadFromJsonAsync<TicketTechnicalOperationResponse>(JsonOptions);
+        Assert.NotNull(body);
+        Assert.Equal(TicketStatus.Resolved, body.Status);
+        Assert.Equal(summary, body.ResolutionSummary);
+        Assert.NotNull(body.ResolvedAt);
+        Assert.Equal(2, factory.AssignmentPersistence.Histories.Count);
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData("   ")]
+    public async Task Resolve_BlankSummary_ReturnsBadRequest(string summary)
+    {
+        var userId = Guid.NewGuid();
+        var ticket = TechnicalTicket(userId, TicketStatus.InProgress);
+        await using var factory = new TicketApiFactory(
+            persistedRole: UserRole.Technician,
+            currentUserId: userId,
+            assignmentTicket: ticket);
+        using var client = factory.CreateHttpsClient();
+
+        var response = await client.PostAsJsonAsync(
+            $"/api/tickets/{ticket.Id}/resolve",
+            new ResolveTicketRequest(summary));
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        Assert.Equal(0, factory.AssignmentPersistence.PersistCallCount);
+    }
+
+    [Fact]
+    public async Task Resolve_MissingSummary_ReturnsCustomValidationBadRequestWithoutPersistenceOrHistory()
+    {
+        var userId = Guid.NewGuid();
+        var ticket = TechnicalTicket(userId, TicketStatus.InProgress);
+        await using var factory = new TicketApiFactory(
+            persistedRole: UserRole.Technician,
+            currentUserId: userId,
+            assignmentTicket: ticket);
+        using var client = factory.CreateHttpsClient();
+        using var content = new StringContent(
+            "{}",
+            System.Text.Encoding.UTF8,
+            "application/json");
+
+        var response = await client.PostAsync($"/api/tickets/{ticket.Id}/resolve", content);
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        var problem = await response.Content.ReadFromJsonAsync<ProblemDetails>();
+        Assert.Equal("Invalid request", problem?.Title);
+        Assert.Equal(0, factory.AssignmentPersistence.PersistCallCount);
+        Assert.Empty(factory.AssignmentPersistence.Histories);
+    }
+
+    [Fact]
+    public async Task Resolve_MalformedJson_ReturnsFrameworkBadRequestWithoutPersistenceOrHistory()
+    {
+        var userId = Guid.NewGuid();
+        var ticket = TechnicalTicket(userId, TicketStatus.InProgress);
+        await using var factory = new TicketApiFactory(
+            persistedRole: UserRole.Technician,
+            currentUserId: userId,
+            assignmentTicket: ticket);
+        using var client = factory.CreateHttpsClient();
+        using var content = new StringContent(
+            "{",
+            System.Text.Encoding.UTF8,
+            "application/json");
+
+        var response = await client.PostAsync($"/api/tickets/{ticket.Id}/resolve", content);
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        Assert.Equal(0, factory.AssignmentPersistence.FindCallCount);
+        Assert.Equal(0, factory.AssignmentPersistence.PersistCallCount);
+        Assert.Empty(factory.AssignmentPersistence.Histories);
+    }
+
+    [Theory]
+    [InlineData(TicketStatus.Assigned)]
+    [InlineData(TicketStatus.Waiting)]
+    public async Task Resolve_InvalidState_ReturnsConflictWithoutPersistence(TicketStatus status)
+    {
+        var userId = Guid.NewGuid();
+        var ticket = TechnicalTicket(userId, status);
+        await using var factory = new TicketApiFactory(
+            persistedRole: UserRole.Technician,
+            currentUserId: userId,
+            assignmentTicket: ticket);
+        using var client = factory.CreateHttpsClient();
+
+        var response = await client.PostAsJsonAsync(
+            $"/api/tickets/{ticket.Id}/resolve",
+            new ResolveTicketRequest("Resolved."));
+
+        Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
+        Assert.Equal(0, factory.AssignmentPersistence.PersistCallCount);
+        Assert.Empty(factory.AssignmentPersistence.Histories);
+    }
+
+    [Fact]
+    public async Task Priority_ValidRequest_ReturnsUpdatedPriority()
+    {
+        var userId = Guid.NewGuid();
+        var ticket = TechnicalTicket(userId, TicketStatus.Assigned);
+        await using var factory = new TicketApiFactory(
+            persistedRole: UserRole.Technician,
+            currentUserId: userId,
+            assignmentTicket: ticket);
+        using var client = factory.CreateHttpsClient();
+
+        var response = await client.PutAsJsonAsync(
+            $"/api/tickets/{ticket.Id}/priority",
+            new ChangeTicketPriorityRequest(TicketPriority.Low));
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        var body = await response.Content.ReadFromJsonAsync<TicketTechnicalOperationResponse>(JsonOptions);
+        Assert.Equal(TicketPriority.Low, body?.Priority);
+        Assert.Equal(
+            TicketHistoryEventType.PriorityChanged,
+            Assert.Single(factory.AssignmentPersistence.Histories).EventType);
+    }
+
+    [Fact]
+    public async Task Priority_UndefinedNumericValue_ReturnsBadRequestWithoutPersistence()
+    {
+        var userId = Guid.NewGuid();
+        var ticket = TechnicalTicket(userId, TicketStatus.Assigned);
+        await using var factory = new TicketApiFactory(
+            persistedRole: UserRole.Technician,
+            currentUserId: userId,
+            assignmentTicket: ticket);
+        using var client = factory.CreateHttpsClient();
+
+        var response = await client.PutAsJsonAsync(
+            $"/api/tickets/{ticket.Id}/priority",
+            new { priority = 999 });
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        Assert.Equal(0, factory.AssignmentPersistence.PersistCallCount);
+    }
+
+    [Theory]
+    [InlineData("{}")]
+    [InlineData("{\"priority\":null}")]
+    public async Task Priority_MissingOrNullValue_ReturnsBadRequestWithoutPersistenceOrHistory(
+        string json)
+    {
+        var userId = Guid.NewGuid();
+        var ticket = TechnicalTicket(userId, TicketStatus.Assigned);
+        await using var factory = new TicketApiFactory(
+            persistedRole: UserRole.Technician,
+            currentUserId: userId,
+            assignmentTicket: ticket);
+        using var client = factory.CreateHttpsClient();
+        using var content = new StringContent(json, System.Text.Encoding.UTF8, "application/json");
+
+        var response = await client.PutAsync($"/api/tickets/{ticket.Id}/priority", content);
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        var problem = await response.Content.ReadFromJsonAsync<ProblemDetails>();
+        Assert.Equal("Invalid request", problem?.Title);
+        Assert.Equal(0, factory.AssignmentPersistence.PersistCallCount);
+        Assert.Empty(factory.AssignmentPersistence.Histories);
+    }
+
+    [Fact]
+    public async Task Priority_SameValue_ReturnsConflictWithoutHistory()
+    {
+        var userId = Guid.NewGuid();
+        var ticket = TechnicalTicket(userId, TicketStatus.Assigned);
+        await using var factory = new TicketApiFactory(
+            persistedRole: UserRole.Technician,
+            currentUserId: userId,
+            assignmentTicket: ticket);
+        using var client = factory.CreateHttpsClient();
+
+        var response = await client.PutAsJsonAsync(
+            $"/api/tickets/{ticket.Id}/priority",
+            new ChangeTicketPriorityRequest(TicketPriority.High));
+
+        Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
+        Assert.Empty(factory.AssignmentPersistence.Histories);
+    }
+
+    [Theory]
+    [InlineData(UserRole.Technician, UserRole.Employee, HttpStatusCode.Forbidden)]
+    [InlineData(UserRole.Administrator, UserRole.Technician, HttpStatusCode.OK)]
+    [InlineData(UserRole.Technician, UserRole.Administrator, HttpStatusCode.Forbidden)]
+    public async Task StartWork_PersistedRoleOverridesStaleJwtRole(
+        UserRole jwtRole,
+        UserRole persistedRole,
+        HttpStatusCode expected)
+    {
+        var userId = Guid.NewGuid();
+        var ticket = TechnicalTicket(userId, TicketStatus.Assigned);
+        await using var factory = new TicketApiFactory(
+            persistedRole: persistedRole,
+            jwtRole: jwtRole,
+            currentUserId: userId,
+            assignmentTicket: ticket);
+        using var client = factory.CreateHttpsClient();
+
+        var response = await client.PostAsync($"/api/tickets/{ticket.Id}/start", null);
+
+        Assert.Equal(expected, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task StartWork_ConcurrencyOutcome_ReturnsConflict()
+    {
+        var userId = Guid.NewGuid();
+        var ticket = TechnicalTicket(userId, TicketStatus.Assigned);
+        await using var factory = new TicketApiFactory(
+            persistedRole: UserRole.Technician,
+            currentUserId: userId,
+            assignmentTicket: ticket,
+            assignmentOutcome: TicketAssignmentPersistenceOutcome.ConcurrencyConflict);
+        using var client = factory.CreateHttpsClient();
+
+        var response = await client.PostAsync($"/api/tickets/{ticket.Id}/start", null);
+
+        Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task StartWork_UnrelatedPersistenceFailure_RemainsObservable()
+    {
+        var userId = Guid.NewGuid();
+        var ticket = TechnicalTicket(userId, TicketStatus.Assigned);
+        var expected = new InvalidOperationException("unexpected persistence failure");
+        await using var factory = new TicketApiFactory(
+            persistedRole: UserRole.Technician,
+            currentUserId: userId,
+            assignmentTicket: ticket,
+            assignmentException: expected);
+        using var client = factory.CreateHttpsClient();
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            client.PostAsync($"/api/tickets/{ticket.Id}/start", null));
+
+        Assert.Same(expected, exception);
+    }
+
     private static CreateTicketRequest ValidCreateRequest()
     {
         return new CreateTicketRequest(
@@ -904,6 +1337,38 @@ public class TicketEndpointsTests
             TicketPriority.High,
             Guid.NewGuid(),
             DateTimeOffset.UtcNow.AddMinutes(-5));
+    }
+
+    private static Ticket TechnicalTicket(Guid technicianId, TicketStatus status)
+    {
+        var ticket = AssignmentTicket();
+        ticket.Assign(technicianId, ticket.CreatedAt.AddMinutes(1));
+        if (status == TicketStatus.Assigned)
+        {
+            return ticket;
+        }
+
+        ticket.StartWork(ticket.UpdatedAt.AddMinutes(1));
+        if (status == TicketStatus.InProgress)
+        {
+            return ticket;
+        }
+
+        ticket.Wait(ticket.UpdatedAt.AddMinutes(1));
+        if (status == TicketStatus.Waiting)
+        {
+            return ticket;
+        }
+
+        ticket.Resume(ticket.UpdatedAt.AddMinutes(1));
+        ticket.Resolve("Resolved.", ticket.UpdatedAt.AddMinutes(1));
+        if (status == TicketStatus.Resolved)
+        {
+            return ticket;
+        }
+
+        ticket.Close(ticket.UpdatedAt.AddMinutes(1));
+        return ticket;
     }
 
     private static GetTicketResult TicketResult(Guid id, Guid? createdByUserId = null)
