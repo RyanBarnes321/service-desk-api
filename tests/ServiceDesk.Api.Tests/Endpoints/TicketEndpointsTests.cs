@@ -1319,6 +1319,229 @@ public class TicketEndpointsTests
         Assert.Same(expected, exception);
     }
 
+    [Theory]
+    [InlineData("close")]
+    [InlineData("reject-resolution")]
+    public async Task ResolutionReview_AnonymousRequest_ReturnsUnauthorized(string operation)
+    {
+        await using var factory = new TicketApiFactory(persistedRole: UserRole.Administrator);
+        using var client = factory.CreateHttpsClient(authenticated: false);
+
+        var response = await client.PostAsync($"/api/tickets/{Guid.NewGuid()}/{operation}", null);
+
+        Assert.Equal(HttpStatusCode.Unauthorized, response.StatusCode);
+        Assert.Equal(0, factory.UserState.CallCount);
+        Assert.Equal(0, factory.AssignmentPersistence.FindCallCount);
+    }
+
+    [Theory]
+    [InlineData("close")]
+    [InlineData("reject-resolution")]
+    public async Task ResolutionReview_InvalidToken_ReturnsUnauthorizedBeforeCurrentUserLookup(
+        string operation)
+    {
+        await using var factory = new TicketApiFactory(persistedRole: UserRole.Administrator);
+        using var client = factory.CreateHttpsClient(accessToken: "not-a-token");
+
+        var response = await client.PostAsync($"/api/tickets/{Guid.NewGuid()}/{operation}", null);
+
+        Assert.Equal(HttpStatusCode.Unauthorized, response.StatusCode);
+        Assert.Equal(0, factory.UserState.CallCount);
+    }
+
+    [Theory]
+    [InlineData("close", false, true)]
+    [InlineData("reject-resolution", false, true)]
+    [InlineData("close", true, false)]
+    [InlineData("reject-resolution", true, false)]
+    public async Task ResolutionReview_InactiveOrMissingCurrentUser_ReturnsForbidden(
+        string operation,
+        bool active,
+        bool exists)
+    {
+        await using var factory = new TicketApiFactory(
+            persistedRole: UserRole.Administrator,
+            isCurrentUserActive: active,
+            currentUserExists: exists);
+        using var client = factory.CreateHttpsClient();
+
+        var response = await client.PostAsync($"/api/tickets/{Guid.NewGuid()}/{operation}", null);
+
+        Assert.Equal(HttpStatusCode.Forbidden, response.StatusCode);
+        Assert.Equal(0, factory.AssignmentPersistence.FindCallCount);
+    }
+
+    [Theory]
+    [InlineData("close", UserRole.Employee)]
+    [InlineData("close", UserRole.Technician)]
+    [InlineData("reject-resolution", UserRole.Employee)]
+    [InlineData("reject-resolution", UserRole.Technician)]
+    public async Task ResolutionReview_NonAdministrator_ReturnsForbiddenBeforeTicketLoad(
+        string operation,
+        UserRole role)
+    {
+        await using var factory = new TicketApiFactory(persistedRole: role);
+        using var client = factory.CreateHttpsClient();
+
+        var response = await client.PostAsync($"/api/tickets/{Guid.NewGuid()}/{operation}", null);
+
+        Assert.Equal(HttpStatusCode.Forbidden, response.StatusCode);
+        Assert.Equal(0, factory.AssignmentPersistence.FindCallCount);
+    }
+
+    [Fact]
+    public async Task Close_ResolvedTicket_ReturnsClosedResponseAndExactHistories()
+    {
+        var technicianId = Guid.NewGuid();
+        var ticket = TechnicalTicket(technicianId, TicketStatus.Resolved);
+        var summary = ticket.ResolutionSummary;
+        var resolvedAt = ticket.ResolvedAt;
+        await using var factory = new TicketApiFactory(
+            persistedRole: UserRole.Administrator,
+            assignmentTicket: ticket);
+        using var client = factory.CreateHttpsClient();
+
+        var response = await client.PostAsync($"/api/tickets/{ticket.Id}/close", null);
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        var body = await response.Content.ReadFromJsonAsync<TicketResolutionReviewResponse>(JsonOptions);
+        Assert.NotNull(body);
+        Assert.Equal(TicketStatus.Closed, body.Status);
+        Assert.Equal(technicianId, body.AssignedTechnicianId);
+        Assert.Equal(summary, body.ResolutionSummary);
+        Assert.Equal(resolvedAt, body.ResolvedAt);
+        Assert.NotNull(body.ClosedAt);
+        Assert.Equal(1, factory.AssignmentPersistence.PersistCallCount);
+        Assert.Equal(TicketHistoryEventType.Closed, factory.AssignmentPersistence.Histories[0].EventType);
+        Assert.Null(factory.AssignmentPersistence.Histories[0].OldValue);
+        Assert.Null(factory.AssignmentPersistence.Histories[0].NewValue);
+        Assert.Equal(TicketHistoryEventType.StatusChanged, factory.AssignmentPersistence.Histories[1].EventType);
+        Assert.Equal("Resolved", factory.AssignmentPersistence.Histories[1].OldValue);
+        Assert.Equal("Closed", factory.AssignmentPersistence.Histories[1].NewValue);
+    }
+
+    [Fact]
+    public async Task RejectResolution_ResolvedTicket_ReturnsInProgressAndAuditsRejectedSummary()
+    {
+        var technicianId = Guid.NewGuid();
+        var ticket = TechnicalTicket(technicianId, TicketStatus.Resolved);
+        var rejectedSummary = ticket.ResolutionSummary;
+        await using var factory = new TicketApiFactory(
+            persistedRole: UserRole.Administrator,
+            assignmentTicket: ticket);
+        using var client = factory.CreateHttpsClient();
+
+        var response = await client.PostAsync($"/api/tickets/{ticket.Id}/reject-resolution", null);
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        var body = await response.Content.ReadFromJsonAsync<TicketResolutionReviewResponse>(JsonOptions);
+        Assert.NotNull(body);
+        Assert.Equal(TicketStatus.InProgress, body.Status);
+        Assert.Equal(technicianId, body.AssignedTechnicianId);
+        Assert.Null(body.ResolutionSummary);
+        Assert.Null(body.ResolvedAt);
+        Assert.Null(body.ClosedAt);
+        var rejected = factory.AssignmentPersistence.Histories[0];
+        Assert.Equal(TicketHistoryEventType.ResolutionRejected, rejected.EventType);
+        Assert.Equal(rejectedSummary, rejected.OldValue);
+        Assert.Null(rejected.NewValue);
+        Assert.Equal(factory.UserId, rejected.PerformedByUserId);
+        Assert.Equal(rejected.CreatedAt, factory.AssignmentPersistence.Histories[1].CreatedAt);
+    }
+
+    [Theory]
+    [InlineData("close")]
+    [InlineData("reject-resolution")]
+    public async Task ResolutionReview_MissingTicket_ReturnsNotFound(string operation)
+    {
+        await using var factory = new TicketApiFactory(persistedRole: UserRole.Administrator);
+        using var client = factory.CreateHttpsClient();
+
+        var response = await client.PostAsync($"/api/tickets/{Guid.NewGuid()}/{operation}", null);
+
+        Assert.Equal(HttpStatusCode.NotFound, response.StatusCode);
+        Assert.Equal(0, factory.AssignmentPersistence.PersistCallCount);
+    }
+
+    [Theory]
+    [InlineData("close")]
+    [InlineData("reject-resolution")]
+    public async Task ResolutionReview_InvalidState_ReturnsConflictWithoutPersistence(string operation)
+    {
+        var ticket = TechnicalTicket(Guid.NewGuid(), TicketStatus.InProgress);
+        await using var factory = new TicketApiFactory(
+            persistedRole: UserRole.Administrator,
+            assignmentTicket: ticket);
+        using var client = factory.CreateHttpsClient();
+
+        var response = await client.PostAsync($"/api/tickets/{ticket.Id}/{operation}", null);
+
+        Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
+        var problem = await response.Content.ReadFromJsonAsync<ProblemDetails>();
+        Assert.Equal("Ticket resolution review conflict", problem?.Title);
+        Assert.Equal(0, factory.AssignmentPersistence.PersistCallCount);
+        Assert.Empty(factory.AssignmentPersistence.Histories);
+    }
+
+    [Theory]
+    [InlineData("close", UserRole.Administrator, UserRole.Employee, HttpStatusCode.Forbidden)]
+    [InlineData("reject-resolution", UserRole.Administrator, UserRole.Employee, HttpStatusCode.Forbidden)]
+    [InlineData("close", UserRole.Administrator, UserRole.Technician, HttpStatusCode.Forbidden)]
+    [InlineData("reject-resolution", UserRole.Administrator, UserRole.Technician, HttpStatusCode.Forbidden)]
+    [InlineData("close", UserRole.Employee, UserRole.Administrator, HttpStatusCode.OK)]
+    [InlineData("reject-resolution", UserRole.Employee, UserRole.Administrator, HttpStatusCode.OK)]
+    [InlineData("close", UserRole.Technician, UserRole.Administrator, HttpStatusCode.OK)]
+    [InlineData("reject-resolution", UserRole.Technician, UserRole.Administrator, HttpStatusCode.OK)]
+    public async Task ResolutionReview_PersistedRoleOverridesStaleJwtRole(
+        string operation,
+        UserRole jwtRole,
+        UserRole persistedRole,
+        HttpStatusCode expected)
+    {
+        var ticket = TechnicalTicket(Guid.NewGuid(), TicketStatus.Resolved);
+        await using var factory = new TicketApiFactory(
+            persistedRole: persistedRole,
+            jwtRole: jwtRole,
+            assignmentTicket: ticket);
+        using var client = factory.CreateHttpsClient();
+
+        var response = await client.PostAsync($"/api/tickets/{ticket.Id}/{operation}", null);
+
+        Assert.Equal(expected, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task Close_ConcurrencyOutcome_ReturnsConflict()
+    {
+        var ticket = TechnicalTicket(Guid.NewGuid(), TicketStatus.Resolved);
+        await using var factory = new TicketApiFactory(
+            persistedRole: UserRole.Administrator,
+            assignmentTicket: ticket,
+            assignmentOutcome: TicketAssignmentPersistenceOutcome.ConcurrencyConflict);
+        using var client = factory.CreateHttpsClient();
+
+        var response = await client.PostAsync($"/api/tickets/{ticket.Id}/close", null);
+
+        Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task RejectResolution_UnrelatedPersistenceFailure_RemainsObservable()
+    {
+        var ticket = TechnicalTicket(Guid.NewGuid(), TicketStatus.Resolved);
+        var expected = new InvalidOperationException("unexpected persistence failure");
+        await using var factory = new TicketApiFactory(
+            persistedRole: UserRole.Administrator,
+            assignmentTicket: ticket,
+            assignmentException: expected);
+        using var client = factory.CreateHttpsClient();
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            client.PostAsync($"/api/tickets/{ticket.Id}/reject-resolution", null));
+
+        Assert.Same(expected, exception);
+    }
+
     private static CreateTicketRequest ValidCreateRequest()
     {
         return new CreateTicketRequest(

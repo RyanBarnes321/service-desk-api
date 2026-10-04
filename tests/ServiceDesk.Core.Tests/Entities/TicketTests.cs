@@ -339,6 +339,9 @@ public class TicketTests
 
     [Theory]
     [InlineData(TicketStatus.Open)]
+    [InlineData(TicketStatus.Assigned)]
+    [InlineData(TicketStatus.InProgress)]
+    [InlineData(TicketStatus.Waiting)]
     [InlineData(TicketStatus.Closed)]
     public void RejectResolution_FromInvalidStatus_ThrowsInvalidOperationException(TicketStatus status)
     {
@@ -361,11 +364,15 @@ public class TicketTests
         Assert.Equal<DateTimeOffset?>(occurredAt, ticket.ClosedAt);
         Assert.Equal(resolutionSummary, ticket.ResolutionSummary);
         Assert.Equal(resolvedAt, ticket.ResolvedAt);
+        Assert.Equal<Guid?>(TechnicianId, ticket.AssignedTechnicianId);
         Assert.Equal(occurredAt, ticket.UpdatedAt);
     }
 
     [Theory]
+    [InlineData(TicketStatus.Open)]
+    [InlineData(TicketStatus.Assigned)]
     [InlineData(TicketStatus.InProgress)]
+    [InlineData(TicketStatus.Waiting)]
     [InlineData(TicketStatus.Closed)]
     public void Close_FromInvalidStatus_ThrowsInvalidOperationException(TicketStatus status)
     {

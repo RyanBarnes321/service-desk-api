@@ -6,6 +6,7 @@ using ServiceDesk.Core.Application.Tickets.GetTicket;
 using ServiceDesk.Core.Application.Tickets.ListTickets;
 using ServiceDesk.Core.Application.Tickets;
 using ServiceDesk.Core.Application.Tickets.Assignment;
+using ServiceDesk.Core.Application.Tickets.ResolutionReview;
 using ServiceDesk.Core.Application.Tickets.TechnicalOperations;
 using ServiceDesk.Core.Security;
 using ServiceDesk.Core.Entities;
@@ -682,6 +683,84 @@ public class PostgreSqlPersistenceTests
             await DeleteTicketsAndUsersAsync(
                 [ticket.Id],
                 [requester.Id, technician.Id]);
+        }
+    }
+
+    [PostgreSqlIntegrationFact]
+    public async Task ResolutionReview_Reject_PersistsStateExactHistoriesAndVersionIncrement()
+    {
+        var createdAt = UtcNowAtPostgreSqlPrecision();
+        var occurredAt = createdAt.AddMinutes(5);
+        var requester = User.Create(
+            $"requester-{Guid.NewGuid():N}@example.com", "hash", "Alex", "Morgan",
+            UserRole.Employee, createdAt);
+        var technician = User.Create(
+            $"technician-{Guid.NewGuid():N}@example.com", "hash", "Taylor", "Rivera",
+            UserRole.Technician, createdAt);
+        var administrator = User.Create(
+            $"administrator-{Guid.NewGuid():N}@example.com", "hash", "Casey", "Jordan",
+            UserRole.Administrator, createdAt);
+        var ticket = Ticket.Create(
+            "Review resolved ticket", "Verify resolution-review persistence.",
+            TicketCategory.Hardware, TicketPriority.Medium, requester.Id, createdAt);
+        ticket.Assign(technician.Id, createdAt.AddMinutes(1));
+        ticket.StartWork(createdAt.AddMinutes(2));
+        const string rejectedSummary = "Replaced the failed component.";
+        ticket.Resolve(rejectedSummary, createdAt.AddMinutes(3));
+
+        try
+        {
+            await using (var setupContext = CreateContext())
+            {
+                setupContext.Users.AddRange(requester, technician, administrator);
+                setupContext.Tickets.Add(ticket);
+                await setupContext.SaveChangesAsync();
+            }
+
+            await using (var mutationContext = CreateContext())
+            {
+                var useCase = new TicketResolutionReviewUseCase(
+                    new TicketAssignmentPersistence(mutationContext),
+                    new FixedTimeProvider(occurredAt));
+
+                var result = await useCase.RejectResolutionAsync(
+                    ticket.Id,
+                    new RequestActor(administrator.Id, UserRole.Administrator));
+
+                Assert.Equal(TicketResolutionReviewOutcome.Success, result.Outcome);
+            }
+
+            await using var verificationContext = CreateContext();
+            var storedTicket = await verificationContext.Tickets
+                .SingleAsync(candidate => candidate.Id == ticket.Id);
+            var histories = await verificationContext.TicketHistory
+                .Where(candidate => candidate.TicketId == ticket.Id)
+                .OrderBy(candidate => candidate.EventType)
+                .ToArrayAsync();
+
+            Assert.Equal(TicketStatus.InProgress, storedTicket.Status);
+            Assert.Equal(technician.Id, storedTicket.AssignedTechnicianId);
+            Assert.Null(storedTicket.ResolutionSummary);
+            Assert.Null(storedTicket.ResolvedAt);
+            Assert.Equal(occurredAt, storedTicket.UpdatedAt);
+            Assert.Equal(1L, verificationContext.Entry(storedTicket).Property<long>("Version").CurrentValue);
+            Assert.Equal(2, histories.Length);
+            var rejection = Assert.Single(histories,
+                history => history.EventType == TicketHistoryEventType.ResolutionRejected);
+            Assert.Equal(rejectedSummary, rejection.OldValue);
+            Assert.Null(rejection.NewValue);
+            Assert.Equal<Guid?>(administrator.Id, rejection.PerformedByUserId);
+            Assert.Equal(occurredAt, rejection.CreatedAt);
+            var status = Assert.Single(histories,
+                history => history.EventType == TicketHistoryEventType.StatusChanged);
+            Assert.Equal("Resolved", status.OldValue);
+            Assert.Equal("InProgress", status.NewValue);
+        }
+        finally
+        {
+            await DeleteTicketsAndUsersAsync(
+                [ticket.Id],
+                [requester.Id, technician.Id, administrator.Id]);
         }
     }
 

@@ -4,6 +4,7 @@ using ServiceDesk.Core.Application.Tickets.Assignment;
 using ServiceDesk.Core.Application.Tickets.CreateTicket;
 using ServiceDesk.Core.Application.Tickets.GetTicket;
 using ServiceDesk.Core.Application.Tickets.ListTickets;
+using ServiceDesk.Core.Application.Tickets.ResolutionReview;
 using ServiceDesk.Core.Application.Tickets.TechnicalOperations;
 
 namespace ServiceDesk.Api.Endpoints;
@@ -27,6 +28,8 @@ public static class TicketEndpoints
         tickets.MapPost("/{id:guid}/resume", ResumeAsync);
         tickets.MapPost("/{id:guid}/resolve", ResolveAsync);
         tickets.MapPut("/{id:guid}/priority", ChangePriorityAsync);
+        tickets.MapPost("/{id:guid}/close", CloseAsync);
+        tickets.MapPost("/{id:guid}/reject-resolution", RejectResolutionAsync);
         tickets.RequireAuthorization(ActiveUserPolicy.Name);
 
         return endpoints;
@@ -369,6 +372,74 @@ public static class TicketEndpoints
             title: "Ticket operation conflict",
             detail: detail);
     }
+
+    private static Task<IResult> CloseAsync(
+        Guid id,
+        TicketResolutionReviewUseCase useCase,
+        HttpContext httpContext,
+        CancellationToken cancellationToken) =>
+        ExecuteResolutionReviewAsync(
+            httpContext,
+            actor => useCase.CloseAsync(id, actor, cancellationToken));
+
+    private static Task<IResult> RejectResolutionAsync(
+        Guid id,
+        TicketResolutionReviewUseCase useCase,
+        HttpContext httpContext,
+        CancellationToken cancellationToken) =>
+        ExecuteResolutionReviewAsync(
+            httpContext,
+            actor => useCase.RejectResolutionAsync(id, actor, cancellationToken));
+
+    private static async Task<IResult> ExecuteResolutionReviewAsync(
+        HttpContext httpContext,
+        Func<ServiceDesk.Core.Application.Authentication.RequestActor,
+            Task<TicketResolutionReviewResult>> execute)
+    {
+        if (!RequestActorContext.TryGet(httpContext, out var actor))
+        {
+            return Results.Forbid();
+        }
+
+        TicketResolutionReviewResult result;
+        try
+        {
+            result = await execute(actor);
+        }
+        catch (TicketResolutionReviewValidationException exception)
+        {
+            return InvalidRequest(exception);
+        }
+
+        return result.Outcome switch
+        {
+            TicketResolutionReviewOutcome.Success => Results.Ok(ToResolutionReviewResponse(result.Ticket!)),
+            TicketResolutionReviewOutcome.Forbidden => Results.Forbid(),
+            TicketResolutionReviewOutcome.TicketNotFound => Results.NotFound(),
+            TicketResolutionReviewOutcome.InvalidState => ResolutionReviewConflict(
+                "The ticket cannot perform this review operation in its current state."),
+            TicketResolutionReviewOutcome.ConcurrencyConflict => ResolutionReviewConflict(
+                "The ticket was changed by another request. Refresh and try again."),
+            _ => throw new InvalidOperationException("Unknown ticket resolution-review outcome.")
+        };
+    }
+
+    private static TicketResolutionReviewResponse ToResolutionReviewResponse(
+        TicketResolutionReviewDetails ticket) =>
+        new(
+            ticket.Id,
+            ticket.Status,
+            ticket.AssignedTechnicianId,
+            ticket.ResolutionSummary,
+            ticket.UpdatedAt,
+            ticket.ResolvedAt,
+            ticket.ClosedAt);
+
+    private static IResult ResolutionReviewConflict(string detail) =>
+        Results.Problem(
+            statusCode: StatusCodes.Status409Conflict,
+            title: "Ticket resolution review conflict",
+            detail: detail);
 
     private static IResult InvalidRequest(ArgumentException exception)
     {
