@@ -81,6 +81,21 @@ public class ServiceDeskDbContextModelTests
         Assert.True(emailIndex.IsUnique);
     }
 
+    [Fact]
+    public void Model_TicketVersion_IsBigintDefaultZeroConcurrencyToken()
+    {
+        using var context = CreateContext();
+        var version = context.Model
+            .FindEntityType(typeof(Ticket))!
+            .FindProperty("Version")!;
+
+        Assert.Equal(typeof(long), version.ClrType);
+        Assert.Equal("version", version.GetColumnName());
+        Assert.Equal("bigint", version.GetColumnType());
+        Assert.Equal(0L, version.GetDefaultValue());
+        Assert.True(version.IsConcurrencyToken);
+    }
+
     private static ServiceDeskDbContext CreateContext()
     {
         var options = new DbContextOptionsBuilder<ServiceDeskDbContext>()

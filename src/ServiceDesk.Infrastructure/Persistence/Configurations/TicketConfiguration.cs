@@ -61,6 +61,11 @@ public class TicketConfiguration : IEntityTypeConfiguration<Ticket>
             .HasColumnName("updated_at")
             .IsRequired();
 
+        builder.Property<long>("Version")
+            .HasColumnName("version")
+            .HasDefaultValue(0L)
+            .IsConcurrencyToken();
+
         builder.Property(ticket => ticket.ResolvedAt)
             .HasColumnName("resolved_at");
 

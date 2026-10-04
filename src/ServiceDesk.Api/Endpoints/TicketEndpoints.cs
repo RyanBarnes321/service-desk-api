@@ -1,5 +1,6 @@
 using ServiceDesk.Api.Contracts.Tickets;
 using ServiceDesk.Api.Security;
+using ServiceDesk.Core.Application.Tickets.Assignment;
 using ServiceDesk.Core.Application.Tickets.CreateTicket;
 using ServiceDesk.Core.Application.Tickets.GetTicket;
 using ServiceDesk.Core.Application.Tickets.ListTickets;
@@ -17,6 +18,9 @@ public static class TicketEndpoints
         tickets.MapPost("/", CreateAsync);
         tickets.MapGet("/", ListAsync);
         tickets.MapGet("/{id:guid}", GetAsync).WithName(GetTicketRouteName);
+        tickets.MapPost("/{id:guid}/claim", ClaimAsync);
+        tickets.MapPut("/{id:guid}/assignment", AssignAsync);
+        tickets.MapDelete("/{id:guid}/assignment", UnassignAsync);
         tickets.RequireAuthorization(ActiveUserPolicy.Name);
 
         return endpoints;
@@ -151,6 +155,93 @@ public static class TicketEndpoints
         {
             return InvalidRequest(exception);
         }
+    }
+
+    private static Task<IResult> ClaimAsync(
+        Guid id,
+        TicketAssignmentUseCase useCase,
+        HttpContext httpContext,
+        CancellationToken cancellationToken)
+    {
+        return ExecuteAssignmentAsync(
+            httpContext,
+            actor => useCase.ClaimAsync(id, actor, cancellationToken));
+    }
+
+    private static Task<IResult> AssignAsync(
+        Guid id,
+        AssignTicketRequest request,
+        TicketAssignmentUseCase useCase,
+        HttpContext httpContext,
+        CancellationToken cancellationToken)
+    {
+        return ExecuteAssignmentAsync(
+            httpContext,
+            actor => useCase.AssignAsync(id, request.TechnicianId, actor, cancellationToken));
+    }
+
+    private static Task<IResult> UnassignAsync(
+        Guid id,
+        TicketAssignmentUseCase useCase,
+        HttpContext httpContext,
+        CancellationToken cancellationToken)
+    {
+        return ExecuteAssignmentAsync(
+            httpContext,
+            actor => useCase.UnassignAsync(id, actor, cancellationToken));
+    }
+
+    private static async Task<IResult> ExecuteAssignmentAsync(
+        HttpContext httpContext,
+        Func<ServiceDesk.Core.Application.Authentication.RequestActor, Task<TicketAssignmentResult>> execute)
+    {
+        if (!RequestActorContext.TryGet(httpContext, out var actor))
+        {
+            return Results.Forbid();
+        }
+
+        TicketAssignmentResult result;
+        try
+        {
+            result = await execute(actor);
+        }
+        catch (ArgumentException exception) when (exception.ParamName is "ticketId")
+        {
+            return InvalidRequest(exception);
+        }
+
+        return result.Outcome switch
+        {
+            TicketAssignmentOutcome.Success => Results.Ok(ToResponse(result.Ticket!)),
+            TicketAssignmentOutcome.Forbidden => Results.Forbid(),
+            TicketAssignmentOutcome.TicketNotFound => Results.NotFound(),
+            TicketAssignmentOutcome.TargetUnavailable => Results.Problem(
+                statusCode: StatusCodes.Status400BadRequest,
+                title: "Invalid technician",
+                detail: "The selected technician is unavailable."),
+            TicketAssignmentOutcome.InvalidState => AssignmentConflict(
+                "The ticket cannot perform this assignment operation in its current state."),
+            TicketAssignmentOutcome.ConcurrencyConflict => AssignmentConflict(
+                "The ticket was changed by another request. Refresh and try again."),
+            _ => throw new InvalidOperationException("Unknown ticket assignment outcome.")
+        };
+    }
+
+    private static TicketAssignmentResponse ToResponse(TicketAssignmentDetails ticket)
+    {
+        return new TicketAssignmentResponse(
+            ticket.Id,
+            ticket.Status,
+            ticket.AssignedTechnicianId,
+            ticket.UpdatedAt);
+    }
+
+    private static IResult AssignmentConflict(string detail)
+    {
+        return Results.Problem(
+            statusCode: StatusCodes.Status409Conflict,
+            title: "Ticket assignment conflict",
+            detail: detail);
     }
 
     private static IResult InvalidRequest(ArgumentException exception)

@@ -5,6 +5,7 @@ using ServiceDesk.Core.Application.Authentication.Login;
 using ServiceDesk.Core.Application.Tickets.GetTicket;
 using ServiceDesk.Core.Application.Tickets.ListTickets;
 using ServiceDesk.Core.Application.Tickets;
+using ServiceDesk.Core.Application.Tickets.Assignment;
 using ServiceDesk.Core.Security;
 using ServiceDesk.Core.Entities;
 using ServiceDesk.Core.Enums;
@@ -476,6 +477,139 @@ public class PostgreSqlPersistenceTests
         }
     }
 
+    [PostgreSqlIntegrationFact]
+    public async Task AssignmentPersistence_ConcurrentClaims_RejectsStaleWriteAndRollsBackLosingHistory()
+    {
+        var createdAt = UtcNowAtPostgreSqlPrecision();
+        var requester = User.Create(
+            $"requester-{Guid.NewGuid():N}@example.com",
+            "requester-password-hash",
+            "Casey",
+            "Morgan",
+            UserRole.Employee,
+            createdAt);
+        var firstTechnician = User.Create(
+            $"technician-{Guid.NewGuid():N}@example.com",
+            "technician-password-hash",
+            "Taylor",
+            "Lee",
+            UserRole.Technician,
+            createdAt);
+        var secondTechnician = User.Create(
+            $"technician-{Guid.NewGuid():N}@example.com",
+            "technician-password-hash",
+            "Jordan",
+            "Rivera",
+            UserRole.Technician,
+            createdAt);
+        var ticket = Ticket.Create(
+            "Concurrent claim",
+            "Two technicians attempt to claim this ticket.",
+            TicketCategory.Network,
+            TicketPriority.High,
+            requester.Id,
+            createdAt);
+
+        try
+        {
+            await using (var setupContext = CreateContext())
+            {
+                setupContext.Users.AddRange(requester, firstTechnician, secondTechnician);
+                setupContext.Tickets.Add(ticket);
+                await setupContext.SaveChangesAsync();
+            }
+
+            await using var firstContext = CreateContext();
+            await using var staleContext = CreateContext();
+            var firstPersistence = new TicketAssignmentPersistence(firstContext);
+            var stalePersistence = new TicketAssignmentPersistence(staleContext);
+            var firstTicket = await firstPersistence.FindTrackedAsync(ticket.Id, CancellationToken.None);
+            var staleTicket = await stalePersistence.FindTrackedAsync(ticket.Id, CancellationToken.None);
+            Assert.NotNull(firstTicket);
+            Assert.NotNull(staleTicket);
+
+            var firstTime = createdAt.AddMinutes(1);
+            firstTicket.Assign(firstTechnician.Id, firstTime);
+            var firstHistories = AssignmentHistories(
+                firstTicket,
+                firstTechnician.Id,
+                firstTechnician.Id,
+                firstTime);
+            var staleTime = createdAt.AddMinutes(2);
+            staleTicket.Assign(secondTechnician.Id, staleTime);
+            var staleHistories = AssignmentHistories(
+                staleTicket,
+                secondTechnician.Id,
+                secondTechnician.Id,
+                staleTime);
+
+            var firstOutcome = await firstPersistence.PersistAsync(
+                firstTicket,
+                firstHistories,
+                CancellationToken.None);
+            var staleOutcome = await stalePersistence.PersistAsync(
+                staleTicket,
+                staleHistories,
+                CancellationToken.None);
+
+            Assert.Equal(TicketAssignmentPersistenceOutcome.Persisted, firstOutcome);
+            Assert.Equal(TicketAssignmentPersistenceOutcome.ConcurrencyConflict, staleOutcome);
+
+            await using (var verificationContext = CreateContext())
+            {
+                var storedTicket = await verificationContext.Tickets
+                    .SingleAsync(candidate => candidate.Id == ticket.Id);
+                var storedHistories = await verificationContext.TicketHistory
+                    .Where(history => history.TicketId == ticket.Id)
+                    .OrderBy(history => history.EventType)
+                    .ToArrayAsync();
+
+                Assert.Equal(firstTechnician.Id, storedTicket.AssignedTechnicianId);
+                Assert.Equal(TicketStatus.Assigned, storedTicket.Status);
+                Assert.Equal(1L, verificationContext.Entry(storedTicket).Property<long>("Version").CurrentValue);
+                Assert.Equal(2, storedHistories.Length);
+                Assert.All(storedHistories, history =>
+                    Assert.Equal<Guid?>(firstTechnician.Id, history.PerformedByUserId));
+            }
+
+            await using (var sequentialContext = CreateContext())
+            {
+                var sequentialPersistence = new TicketAssignmentPersistence(sequentialContext);
+                var sequentialTicket = await sequentialPersistence.FindTrackedAsync(
+                    ticket.Id,
+                    CancellationToken.None);
+                Assert.NotNull(sequentialTicket);
+                var oldTechnicianId = sequentialTicket.AssignedTechnicianId;
+                sequentialTicket.Reassign(secondTechnician.Id, createdAt.AddMinutes(3));
+                var history = TicketHistory.Create(
+                    ticket.Id,
+                    firstTechnician.Id,
+                    TicketHistoryEventType.Reassigned,
+                    oldTechnicianId!.Value.ToString(),
+                    secondTechnician.Id.ToString(),
+                    createdAt.AddMinutes(3));
+
+                var outcome = await sequentialPersistence.PersistAsync(
+                    sequentialTicket,
+                    [history],
+                    CancellationToken.None);
+
+                Assert.Equal(TicketAssignmentPersistenceOutcome.Persisted, outcome);
+            }
+
+            await using var finalContext = CreateContext();
+            var finalTicket = await finalContext.Tickets.SingleAsync(candidate => candidate.Id == ticket.Id);
+            Assert.Equal(2L, finalContext.Entry(finalTicket).Property<long>("Version").CurrentValue);
+            Assert.Equal(secondTechnician.Id, finalTicket.AssignedTechnicianId);
+        }
+        finally
+        {
+            await DeleteTicketsAndUsersAsync(
+                [ticket.Id],
+                [requester.Id, firstTechnician.Id, secondTechnician.Id]);
+        }
+    }
+
     private static ServiceDeskDbContext CreateContext()
     {
         var options = new DbContextOptionsBuilder<ServiceDeskDbContext>()
@@ -502,6 +636,31 @@ public class PostgreSqlPersistenceTests
             createdAt);
         ticket.Assign(technicianId, createdAt);
         return ticket;
+    }
+
+    private static TicketHistory[] AssignmentHistories(
+        Ticket ticket,
+        Guid performedByUserId,
+        Guid technicianId,
+        DateTimeOffset occurredAt)
+    {
+        return
+        [
+            TicketHistory.Create(
+                ticket.Id,
+                performedByUserId,
+                TicketHistoryEventType.Assigned,
+                null,
+                technicianId.ToString(),
+                occurredAt),
+            TicketHistory.Create(
+                ticket.Id,
+                performedByUserId,
+                TicketHistoryEventType.StatusChanged,
+                TicketStatus.Open.ToString(),
+                TicketStatus.Assigned.ToString(),
+                occurredAt)
+        ];
     }
 
     private static DateTimeOffset UtcNowAtPostgreSqlPrecision()
