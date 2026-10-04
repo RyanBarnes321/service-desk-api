@@ -6,6 +6,7 @@ using ServiceDesk.Core.Application.Tickets.GetTicket;
 using ServiceDesk.Core.Application.Tickets.ListTickets;
 using ServiceDesk.Core.Application.Tickets;
 using ServiceDesk.Core.Application.Tickets.Assignment;
+using ServiceDesk.Core.Application.Tickets.Comments;
 using ServiceDesk.Core.Application.Tickets.ResolutionReview;
 using ServiceDesk.Core.Application.Tickets.TechnicalOperations;
 using ServiceDesk.Core.Security;
@@ -761,6 +762,95 @@ public class PostgreSqlPersistenceTests
             await DeleteTicketsAndUsersAsync(
                 [ticket.Id],
                 [requester.Id, technician.Id, administrator.Id]);
+        }
+    }
+
+    [PostgreSqlIntegrationFact]
+    public async Task TicketComments_CreateAndList_PreserveTicketAndApplyVisibilityOrderingPagination()
+    {
+        var createdAt = UtcNowAtPostgreSqlPrecision();
+        var commentAt = createdAt.AddMinutes(1);
+        var creator = User.Create(
+            $"comment-creator-{Guid.NewGuid():N}@example.com", "hash", "Alex", "Morgan",
+            UserRole.Employee, createdAt);
+        var otherEmployee = User.Create(
+            $"other-comment-reader-{Guid.NewGuid():N}@example.com", "hash", "Other", "Reader",
+            UserRole.Employee, createdAt);
+        var technician = User.Create(
+            $"comment-technician-{Guid.NewGuid():N}@example.com", "hash", "Taylor", "Rivera",
+            UserRole.Technician, createdAt);
+        var ticket = Ticket.Create(
+            "Comment persistence", "Verify immutable comment creation and reads.",
+            TicketCategory.Software, TicketPriority.Medium, creator.Id, createdAt);
+
+        try
+        {
+            await using (var setupContext = CreateContext())
+            {
+                setupContext.Users.AddRange(creator, otherEmployee, technician);
+                setupContext.Tickets.Add(ticket);
+                await setupContext.SaveChangesAsync();
+            }
+
+            TicketCommentResult first;
+            TicketCommentResult second;
+            await using (var createContext = CreateContext())
+            {
+                var persistence = new TicketCommentsPersistence(createContext);
+                var useCase = new CreateTicketCommentUseCase(
+                    persistence,
+                    new FixedTimeProvider(commentAt));
+                first = (await useCase.ExecuteAsync(
+                    ticket.Id,
+                    "Creator note",
+                    new RequestActor(creator.Id, UserRole.Employee))).Comment!;
+                second = (await useCase.ExecuteAsync(
+                    ticket.Id,
+                    "Technician note",
+                    new RequestActor(technician.Id, UserRole.Technician))).Comment!;
+            }
+
+            await using var verificationContext = CreateContext();
+            var persistenceQuery = new TicketCommentsPersistence(verificationContext);
+            var expected = new[] { first, second }
+                .OrderBy(item => item.Id.ToString(), StringComparer.Ordinal)
+                .ToArray();
+            var firstPage = await persistenceQuery.ListAsync(
+                ticket.Id,
+                new ListTicketCommentsRequest(1, 1),
+                TicketVisibilityScope.For(new RequestActor(creator.Id, UserRole.Employee)),
+                CancellationToken.None);
+            var secondPage = await persistenceQuery.ListAsync(
+                ticket.Id,
+                new ListTicketCommentsRequest(2, 1),
+                TicketVisibilityScope.For(new RequestActor(technician.Id, UserRole.Technician)),
+                CancellationToken.None);
+            var concealed = await persistenceQuery.ListAsync(
+                ticket.Id,
+                new ListTicketCommentsRequest(),
+                TicketVisibilityScope.For(new RequestActor(otherEmployee.Id, UserRole.Employee)),
+                CancellationToken.None);
+            var storedTicket = await verificationContext.Tickets
+                .SingleAsync(candidate => candidate.Id == ticket.Id);
+            var historyCount = await verificationContext.TicketHistory
+                .CountAsync(candidate => candidate.TicketId == ticket.Id);
+
+            Assert.NotNull(firstPage);
+            Assert.NotNull(secondPage);
+            Assert.Equal(expected[0].Id, Assert.Single(firstPage.Items).Id);
+            Assert.Equal(expected[1].Id, Assert.Single(secondPage.Items).Id);
+            Assert.Equal(2, firstPage.TotalCount);
+            Assert.Equal(2, firstPage.TotalPages);
+            Assert.Null(concealed);
+            Assert.Equal(createdAt, storedTicket.UpdatedAt);
+            Assert.Equal(0L, verificationContext.Entry(storedTicket).Property<long>("Version").CurrentValue);
+            Assert.Equal(0, historyCount);
+        }
+        finally
+        {
+            await DeleteTicketsAndUsersAsync(
+                [ticket.Id],
+                [creator.Id, otherEmployee.Id, technician.Id]);
         }
     }
 

@@ -16,6 +16,7 @@ using ServiceDesk.Api.Contracts.Tickets;
 using ServiceDesk.Core.Application.Authentication;
 using ServiceDesk.Core.Application.Tickets;
 using ServiceDesk.Core.Application.Tickets.Assignment;
+using ServiceDesk.Core.Application.Tickets.Comments;
 using ServiceDesk.Core.Application.Tickets.CreateTicket;
 using ServiceDesk.Core.Application.Tickets.GetTicket;
 using ServiceDesk.Core.Application.Tickets.ListTickets;
@@ -1542,6 +1543,390 @@ public class TicketEndpointsTests
         Assert.Same(expected, exception);
     }
 
+    [Theory]
+    [InlineData("POST")]
+    [InlineData("GET")]
+    public async Task Comments_AnonymousRequest_ReturnsUnauthorized(string method)
+    {
+        await using var factory = new TicketApiFactory(commentTicketId: Guid.NewGuid());
+        using var client = factory.CreateHttpsClient(authenticated: false);
+        using var request = new HttpRequestMessage(
+            new HttpMethod(method),
+            $"/api/tickets/{Guid.NewGuid()}/comments");
+        if (method == "POST") request.Content = JsonContent.Create(new CreateTicketCommentRequest("Note"));
+
+        var response = await client.SendAsync(request);
+
+        Assert.Equal(HttpStatusCode.Unauthorized, response.StatusCode);
+        Assert.Equal(0, factory.CommentsPersistence.FindCallCount);
+        Assert.Equal(0, factory.CommentsPersistence.ListCallCount);
+    }
+
+    [Theory]
+    [InlineData("POST")]
+    [InlineData("GET")]
+    public async Task Comments_InvalidToken_ReturnsUnauthorizedBeforeCurrentUserLookup(string method)
+    {
+        await using var factory = new TicketApiFactory(commentTicketId: Guid.NewGuid());
+        using var client = factory.CreateHttpsClient(accessToken: "not-a-token");
+        using var request = new HttpRequestMessage(
+            new HttpMethod(method),
+            $"/api/tickets/{Guid.NewGuid()}/comments");
+        if (method == "POST") request.Content = JsonContent.Create(new CreateTicketCommentRequest("Note"));
+
+        var response = await client.SendAsync(request);
+
+        Assert.Equal(HttpStatusCode.Unauthorized, response.StatusCode);
+        Assert.Equal(0, factory.UserState.CallCount);
+    }
+
+    [Theory]
+    [InlineData("POST", false, true)]
+    [InlineData("GET", false, true)]
+    [InlineData("POST", true, false)]
+    [InlineData("GET", true, false)]
+    public async Task Comments_MissingOrInactiveCurrentUser_ReturnsForbidden(
+        string method,
+        bool active,
+        bool exists)
+    {
+        var ticketId = Guid.NewGuid();
+        await using var factory = new TicketApiFactory(
+            isCurrentUserActive: active,
+            currentUserExists: exists,
+            commentTicketId: ticketId);
+        using var client = factory.CreateHttpsClient();
+
+        using var request = new HttpRequestMessage(
+            new HttpMethod(method),
+            $"/api/tickets/{ticketId}/comments");
+        if (method == "POST") request.Content = JsonContent.Create(new CreateTicketCommentRequest("Note"));
+        var response = await client.SendAsync(request);
+
+        Assert.Equal(HttpStatusCode.Forbidden, response.StatusCode);
+        Assert.Equal(0, factory.CommentsPersistence.ListCallCount);
+    }
+
+    [Theory]
+    [InlineData("POST")]
+    [InlineData("GET")]
+    public async Task Comments_NonexistentTicket_ReturnsNotFound(string method)
+    {
+        var ticketId = Guid.NewGuid();
+        await using var factory = new TicketApiFactory(
+            persistedRole: UserRole.Administrator,
+            commentTicketId: ticketId,
+            commentTicketExists: false);
+        using var client = factory.CreateHttpsClient();
+        using var request = new HttpRequestMessage(
+            new HttpMethod(method),
+            $"/api/tickets/{ticketId}/comments");
+        if (method == "POST") request.Content = JsonContent.Create(new CreateTicketCommentRequest("Note"));
+
+        var response = await client.SendAsync(request);
+
+        Assert.Equal(HttpStatusCode.NotFound, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task CreateComment_EmployeeOwnOpenTicket_ReturnsCreatedWithActorAsAuthor()
+    {
+        var userId = Guid.NewGuid();
+        var ticketId = Guid.NewGuid();
+        await using var factory = new TicketApiFactory(
+            currentUserId: userId,
+            persistedRole: UserRole.Employee,
+            commentTicketId: ticketId,
+            commentTicketCreatorId: userId);
+        using var client = factory.CreateHttpsClient();
+
+        var response = await client.PostAsJsonAsync(
+            $"/api/tickets/{ticketId}/comments",
+            new
+            {
+                content = "The issue returned.",
+                authorUserId = Guid.NewGuid()
+            });
+
+        Assert.Equal(HttpStatusCode.Created, response.StatusCode);
+        var body = await response.Content.ReadFromJsonAsync<TicketCommentResponse>();
+        Assert.NotNull(body);
+        Assert.Equal(ticketId, body.TicketId);
+        Assert.Equal(userId, body.AuthorUserId);
+        Assert.Equal("The issue returned.", body.Content);
+        Assert.Equal($"/api/tickets/{ticketId}/comments", response.Headers.Location?.ToString());
+        Assert.Equal(1, factory.CommentsPersistence.PersistCallCount);
+    }
+
+    [Fact]
+    public async Task CreateComment_EmployeeOtherTicket_IsConcealed()
+    {
+        var ticketId = Guid.NewGuid();
+        await using var factory = new TicketApiFactory(
+            persistedRole: UserRole.Employee,
+            commentTicketId: ticketId,
+            commentTicketCreatorId: Guid.NewGuid(),
+            commentTicketStatus: TicketStatus.Closed);
+        using var client = factory.CreateHttpsClient();
+
+        var response = await client.PostAsJsonAsync(
+            $"/api/tickets/{ticketId}/comments",
+            new CreateTicketCommentRequest("Hidden ticket note."));
+
+        Assert.Equal(HttpStatusCode.NotFound, response.StatusCode);
+        Assert.Equal(0, factory.CommentsPersistence.PersistCallCount);
+    }
+
+    [Theory]
+    [InlineData(UserRole.Technician)]
+    [InlineData(UserRole.Administrator)]
+    public async Task CreateComment_PrivilegedRole_UnownedActiveTicketSucceeds(UserRole role)
+    {
+        var ticketId = Guid.NewGuid();
+        await using var factory = new TicketApiFactory(
+            persistedRole: role,
+            commentTicketId: ticketId,
+            commentTicketCreatorId: Guid.NewGuid(),
+            commentTicketStatus: TicketStatus.Resolved);
+        using var client = factory.CreateHttpsClient();
+
+        var response = await client.PostAsJsonAsync(
+            $"/api/tickets/{ticketId}/comments",
+            new CreateTicketCommentRequest("Review note."));
+
+        Assert.Equal(HttpStatusCode.Created, response.StatusCode);
+    }
+
+    [Theory]
+    [InlineData(UserRole.Employee)]
+    [InlineData(UserRole.Technician)]
+    [InlineData(UserRole.Administrator)]
+    public async Task CreateComment_VisibleClosedTicket_ReturnsConflict(UserRole role)
+    {
+        var userId = Guid.NewGuid();
+        var ticketId = Guid.NewGuid();
+        await using var factory = new TicketApiFactory(
+            currentUserId: userId,
+            persistedRole: role,
+            commentTicketId: ticketId,
+            commentTicketCreatorId: userId,
+            commentTicketStatus: TicketStatus.Closed);
+        using var client = factory.CreateHttpsClient();
+
+        var response = await client.PostAsJsonAsync(
+            $"/api/tickets/{ticketId}/comments",
+            new CreateTicketCommentRequest("Late note."));
+
+        Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
+        Assert.Equal(0, factory.CommentsPersistence.PersistCallCount);
+    }
+
+    [Theory]
+    [InlineData("{}")]
+    [InlineData("{\"content\":null}")]
+    [InlineData("{\"content\":\"\"}")]
+    [InlineData("{\"content\":\"   \"}")]
+    public async Task CreateComment_InvalidContent_ReturnsBadRequestWithoutPersistence(string json)
+    {
+        var userId = Guid.NewGuid();
+        var ticketId = Guid.NewGuid();
+        await using var factory = new TicketApiFactory(
+            currentUserId: userId,
+            persistedRole: UserRole.Employee,
+            commentTicketId: ticketId,
+            commentTicketCreatorId: userId);
+        using var client = factory.CreateHttpsClient();
+        using var content = new StringContent(json, System.Text.Encoding.UTF8, "application/json");
+
+        var response = await client.PostAsync($"/api/tickets/{ticketId}/comments", content);
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        var problem = await response.Content.ReadFromJsonAsync<ProblemDetails>();
+        Assert.Equal("Invalid request", problem?.Title);
+        Assert.Equal(0, factory.CommentsPersistence.PersistCallCount);
+    }
+
+    [Fact]
+    public async Task CreateComment_MalformedJson_ReturnsFrameworkBadRequestWithoutCommentQuery()
+    {
+        var ticketId = Guid.NewGuid();
+        await using var factory = new TicketApiFactory(
+            persistedRole: UserRole.Administrator,
+            commentTicketId: ticketId);
+        using var client = factory.CreateHttpsClient();
+        using var content = new StringContent("{", System.Text.Encoding.UTF8, "application/json");
+
+        var response = await client.PostAsync($"/api/tickets/{ticketId}/comments", content);
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        Assert.Equal(0, factory.CommentsPersistence.FindCallCount);
+        Assert.Equal(0, factory.CommentsPersistence.PersistCallCount);
+    }
+
+    [Fact]
+    public async Task CreateComment_OverLimitReturnsBadRequest_ExactLimitSucceeds()
+    {
+        var userId = Guid.NewGuid();
+        var ticketId = Guid.NewGuid();
+        await using var factory = new TicketApiFactory(
+            currentUserId: userId,
+            persistedRole: UserRole.Employee,
+            commentTicketId: ticketId,
+            commentTicketCreatorId: userId);
+        using var client = factory.CreateHttpsClient();
+
+        var invalid = await client.PostAsJsonAsync(
+            $"/api/tickets/{ticketId}/comments",
+            new CreateTicketCommentRequest(new string('x', TicketComment.MaximumContentLength + 1)));
+        var valid = await client.PostAsJsonAsync(
+            $"/api/tickets/{ticketId}/comments",
+            new CreateTicketCommentRequest(new string('x', TicketComment.MaximumContentLength)));
+
+        Assert.Equal(HttpStatusCode.BadRequest, invalid.StatusCode);
+        Assert.Equal(HttpStatusCode.Created, valid.StatusCode);
+        Assert.Equal(1, factory.CommentsPersistence.PersistCallCount);
+    }
+
+    [Fact]
+    public async Task ListComments_EmployeeOwnClosedTicket_ReturnsItemsAndMetadata()
+    {
+        var userId = Guid.NewGuid();
+        var ticketId = Guid.NewGuid();
+        var first = new TicketCommentResult(
+            Guid.Parse("11111111-1111-1111-1111-111111111111"), ticketId, userId,
+            "First", new DateTimeOffset(2026, 10, 4, 10, 0, 0, TimeSpan.Zero));
+        var second = new TicketCommentResult(
+            Guid.Parse("22222222-2222-2222-2222-222222222222"), ticketId, Guid.NewGuid(),
+            "Second", first.CreatedAt.AddMinutes(1));
+        await using var factory = new TicketApiFactory(
+            currentUserId: userId,
+            persistedRole: UserRole.Employee,
+            commentTicketId: ticketId,
+            commentTicketCreatorId: userId,
+            commentTicketStatus: TicketStatus.Closed,
+            commentsResult: new ListTicketCommentsResult([first, second], 1, 20, 2, 1));
+        using var client = factory.CreateHttpsClient();
+
+        var response = await client.GetAsync($"/api/tickets/{ticketId}/comments");
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        var body = await response.Content.ReadFromJsonAsync<ListTicketCommentsResponse>();
+        Assert.NotNull(body);
+        Assert.Equal(2, body.Items.Count);
+        Assert.Equal([first.Id, second.Id], body.Items.Select(item => item.Id));
+        Assert.Equal(1, body.Page);
+        Assert.Equal(20, body.PageSize);
+        Assert.Equal(2, body.TotalCount);
+        Assert.Equal(1, body.TotalPages);
+        Assert.Equal(new ListTicketCommentsRequest(), factory.CommentsPersistence.ListRequest);
+    }
+
+    [Fact]
+    public async Task ListComments_EmployeeOtherTicket_ReturnsNotFound()
+    {
+        var ticketId = Guid.NewGuid();
+        await using var factory = new TicketApiFactory(
+            persistedRole: UserRole.Employee,
+            commentTicketId: ticketId,
+            commentTicketCreatorId: Guid.NewGuid());
+        using var client = factory.CreateHttpsClient();
+
+        var response = await client.GetAsync($"/api/tickets/{ticketId}/comments");
+
+        Assert.Equal(HttpStatusCode.NotFound, response.StatusCode);
+    }
+
+    [Theory]
+    [InlineData(UserRole.Technician)]
+    [InlineData(UserRole.Administrator)]
+    public async Task ListComments_PrivilegedRole_CanReadUnownedClosedTicket(UserRole role)
+    {
+        var ticketId = Guid.NewGuid();
+        await using var factory = new TicketApiFactory(
+            persistedRole: role,
+            commentTicketId: ticketId,
+            commentTicketCreatorId: Guid.NewGuid(),
+            commentTicketStatus: TicketStatus.Closed);
+        using var client = factory.CreateHttpsClient();
+
+        var response = await client.GetAsync($"/api/tickets/{ticketId}/comments");
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+    }
+
+    [Theory]
+    [InlineData("?page=0")]
+    [InlineData("?pageSize=0")]
+    [InlineData("?pageSize=101")]
+    public async Task ListComments_InvalidPagination_ReturnsBadRequest(string query)
+    {
+        var ticketId = Guid.NewGuid();
+        await using var factory = new TicketApiFactory(
+            persistedRole: UserRole.Technician,
+            commentTicketId: ticketId);
+        using var client = factory.CreateHttpsClient();
+
+        var response = await client.GetAsync($"/api/tickets/{ticketId}/comments{query}");
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        Assert.Equal(0, factory.CommentsPersistence.ListCallCount);
+    }
+
+    [Fact]
+    public async Task ListComments_CustomPagination_MapsQueryAndEmptyMetadata()
+    {
+        var ticketId = Guid.NewGuid();
+        await using var factory = new TicketApiFactory(
+            persistedRole: UserRole.Technician,
+            commentTicketId: ticketId,
+            commentsResult: new ListTicketCommentsResult([], 3, 50, 0, 0));
+        using var client = factory.CreateHttpsClient();
+
+        var body = await client.GetFromJsonAsync<ListTicketCommentsResponse>(
+            $"/api/tickets/{ticketId}/comments?page=3&pageSize=50");
+
+        Assert.NotNull(body);
+        Assert.Empty(body.Items);
+        Assert.Equal(3, body.Page);
+        Assert.Equal(50, body.PageSize);
+        Assert.Equal(0, body.TotalCount);
+        Assert.Equal(0, body.TotalPages);
+    }
+
+    [Theory]
+    [InlineData("POST", UserRole.Technician, UserRole.Employee, false)]
+    [InlineData("GET", UserRole.Technician, UserRole.Employee, false)]
+    [InlineData("POST", UserRole.Administrator, UserRole.Employee, false)]
+    [InlineData("GET", UserRole.Administrator, UserRole.Employee, false)]
+    [InlineData("POST", UserRole.Employee, UserRole.Technician, true)]
+    [InlineData("GET", UserRole.Employee, UserRole.Technician, true)]
+    [InlineData("POST", UserRole.Technician, UserRole.Administrator, true)]
+    [InlineData("GET", UserRole.Technician, UserRole.Administrator, true)]
+    public async Task Comments_PersistedRoleOverridesStaleJwtRole(
+        string method,
+        UserRole jwtRole,
+        UserRole persistedRole,
+        bool expectedVisible)
+    {
+        var ticketId = Guid.NewGuid();
+        await using var factory = new TicketApiFactory(
+            jwtRole: jwtRole,
+            persistedRole: persistedRole,
+            commentTicketId: ticketId,
+            commentTicketCreatorId: Guid.NewGuid());
+        using var client = factory.CreateHttpsClient();
+        using var request = new HttpRequestMessage(
+            new HttpMethod(method),
+            $"/api/tickets/{ticketId}/comments");
+        if (method == "POST") request.Content = JsonContent.Create(new CreateTicketCommentRequest("Note"));
+
+        var response = await client.SendAsync(request);
+
+        Assert.Equal(
+            expectedVisible ? method == "POST" ? HttpStatusCode.Created : HttpStatusCode.OK : HttpStatusCode.NotFound,
+            response.StatusCode);
+    }
+
     private static CreateTicketRequest ValidCreateRequest()
     {
         return new CreateTicketRequest(
@@ -1645,7 +2030,12 @@ public class TicketEndpointsTests
             TicketAssignmentPersistenceOutcome assignmentOutcome =
                 TicketAssignmentPersistenceOutcome.Persisted,
             Exception? assignmentException = null,
-            CurrentUserState? targetUserState = null)
+            CurrentUserState? targetUserState = null,
+            Guid? commentTicketId = null,
+            Guid? commentTicketCreatorId = null,
+            TicketStatus commentTicketStatus = TicketStatus.Open,
+            bool commentTicketExists = true,
+            ListTicketCommentsResult? commentsResult = null)
         {
             UserId = currentUserId ?? Guid.NewGuid();
             JwtRole = jwtRole;
@@ -1662,6 +2052,11 @@ public class TicketEndpointsTests
                 assignmentTicket,
                 assignmentOutcome,
                 assignmentException);
+            CommentsPersistence = new StubTicketCommentsPersistence(
+                commentTicketExists ? commentTicketId : null,
+                commentTicketCreatorId,
+                commentTicketStatus,
+                commentsResult ?? new ListTicketCommentsResult([], 1, 20, 0, 0));
         }
 
         public Guid UserId { get; }
@@ -1677,6 +2072,8 @@ public class TicketEndpointsTests
         public StubCurrentUserStateQuery UserState { get; }
 
         public RecordingTicketAssignmentPersistence AssignmentPersistence { get; }
+
+        public StubTicketCommentsPersistence CommentsPersistence { get; }
 
         public HttpClient CreateHttpsClient(
             bool authenticated = true,
@@ -1713,11 +2110,15 @@ public class TicketEndpointsTests
                 services.RemoveAll<IListTicketsQuery>();
                 services.RemoveAll<ICurrentUserStateQuery>();
                 services.RemoveAll<ITicketAssignmentPersistence>();
+                services.RemoveAll<ICreateTicketCommentPersistence>();
+                services.RemoveAll<IListTicketCommentsQuery>();
                 services.AddSingleton<ICreateTicketPersistence>(Persistence);
                 services.AddSingleton<IGetTicketQuery>(Query);
                 services.AddSingleton<IListTicketsQuery>(ListQuery);
                 services.AddSingleton<ICurrentUserStateQuery>(UserState);
                 services.AddSingleton<ITicketAssignmentPersistence>(AssignmentPersistence);
+                services.AddSingleton<ICreateTicketCommentPersistence>(CommentsPersistence);
+                services.AddSingleton<IListTicketCommentsQuery>(CommentsPersistence);
             });
         }
     }
@@ -1797,6 +2198,55 @@ public class TicketEndpointsTests
             }
 
             return Task.FromResult(outcome);
+        }
+    }
+
+    private sealed class StubTicketCommentsPersistence(
+        Guid? ticketId,
+        Guid? creatorId,
+        TicketStatus status,
+        ListTicketCommentsResult listResult)
+        : ICreateTicketCommentPersistence, IListTicketCommentsQuery
+    {
+        public int FindCallCount { get; private set; }
+        public int PersistCallCount { get; private set; }
+        public int ListCallCount { get; private set; }
+        public TicketComment? PersistedComment { get; private set; }
+        public ListTicketCommentsRequest? ListRequest { get; private set; }
+
+        public Task<CreateTicketCommentTarget?> FindVisibleTicketAsync(
+            Guid requestedTicketId,
+            TicketVisibilityScope visibility,
+            CancellationToken cancellationToken)
+        {
+            FindCallCount++;
+            CreateTicketCommentTarget? result = ticketId == requestedTicketId &&
+                (visibility.CreatedByUserId is null || visibility.CreatedByUserId == creatorId)
+                ? new(requestedTicketId, status)
+                : null;
+            return Task.FromResult(result);
+        }
+
+        public Task PersistAsync(TicketComment comment, CancellationToken cancellationToken)
+        {
+            PersistCallCount++;
+            PersistedComment = comment;
+            return Task.CompletedTask;
+        }
+
+        public Task<ListTicketCommentsResult?> ListAsync(
+            Guid requestedTicketId,
+            ListTicketCommentsRequest request,
+            TicketVisibilityScope visibility,
+            CancellationToken cancellationToken)
+        {
+            ListCallCount++;
+            ListRequest = request;
+            ListTicketCommentsResult? result = ticketId == requestedTicketId &&
+                (visibility.CreatedByUserId is null || visibility.CreatedByUserId == creatorId)
+                ? listResult with { Page = request.Page, PageSize = request.PageSize }
+                : null;
+            return Task.FromResult(result);
         }
     }
 

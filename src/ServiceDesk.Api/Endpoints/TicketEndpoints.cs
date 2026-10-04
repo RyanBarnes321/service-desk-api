@@ -1,6 +1,7 @@
 using ServiceDesk.Api.Contracts.Tickets;
 using ServiceDesk.Api.Security;
 using ServiceDesk.Core.Application.Tickets.Assignment;
+using ServiceDesk.Core.Application.Tickets.Comments;
 using ServiceDesk.Core.Application.Tickets.CreateTicket;
 using ServiceDesk.Core.Application.Tickets.GetTicket;
 using ServiceDesk.Core.Application.Tickets.ListTickets;
@@ -30,6 +31,8 @@ public static class TicketEndpoints
         tickets.MapPut("/{id:guid}/priority", ChangePriorityAsync);
         tickets.MapPost("/{id:guid}/close", CloseAsync);
         tickets.MapPost("/{id:guid}/reject-resolution", RejectResolutionAsync);
+        tickets.MapPost("/{id:guid}/comments", CreateCommentAsync);
+        tickets.MapGet("/{id:guid}/comments", ListCommentsAsync);
         tickets.RequireAuthorization(ActiveUserPolicy.Name);
 
         return endpoints;
@@ -440,6 +443,91 @@ public static class TicketEndpoints
             statusCode: StatusCodes.Status409Conflict,
             title: "Ticket resolution review conflict",
             detail: detail);
+
+    private static async Task<IResult> CreateCommentAsync(
+        Guid id,
+        CreateTicketCommentRequest request,
+        CreateTicketCommentUseCase useCase,
+        HttpContext httpContext,
+        CancellationToken cancellationToken)
+    {
+        if (!RequestActorContext.TryGet(httpContext, out var actor))
+        {
+            return Results.Forbid();
+        }
+
+        CreateTicketCommentResult result;
+        try
+        {
+            result = await useCase.ExecuteAsync(id, request.Content, actor, cancellationToken);
+        }
+        catch (TicketCommentsValidationException exception)
+        {
+            return InvalidRequest(exception);
+        }
+
+        return result.Outcome switch
+        {
+            CreateTicketCommentOutcome.Success => Results.Created(
+                $"/api/tickets/{id}/comments",
+                ToCommentResponse(result.Comment!)),
+            CreateTicketCommentOutcome.TicketNotFound => Results.NotFound(),
+            CreateTicketCommentOutcome.TicketClosed => Results.Problem(
+                statusCode: StatusCodes.Status409Conflict,
+                title: "Ticket comment conflict",
+                detail: "Closed tickets cannot receive new comments."),
+            _ => throw new InvalidOperationException("Unknown create-ticket-comment outcome.")
+        };
+    }
+
+    private static async Task<IResult> ListCommentsAsync(
+        Guid id,
+        [AsParameters] ListTicketCommentsQueryRequest request,
+        ListTicketCommentsUseCase useCase,
+        HttpContext httpContext,
+        CancellationToken cancellationToken)
+    {
+        if (!RequestActorContext.TryGet(httpContext, out var actor))
+        {
+            return Results.Forbid();
+        }
+
+        ListTicketCommentsResult? result;
+        try
+        {
+            result = await useCase.ExecuteAsync(
+                id,
+                new ListTicketCommentsRequest(
+                    request.Page ?? ListTicketCommentsRequest.DefaultPage,
+                    request.PageSize ?? ListTicketCommentsRequest.DefaultPageSize),
+                actor,
+                cancellationToken);
+        }
+        catch (TicketCommentsValidationException exception)
+        {
+            return InvalidRequest(exception);
+        }
+
+        if (result is null)
+        {
+            return Results.NotFound();
+        }
+
+        return Results.Ok(new ListTicketCommentsResponse(
+            result.Items.Select(ToCommentResponse).ToArray(),
+            result.Page,
+            result.PageSize,
+            result.TotalCount,
+            result.TotalPages));
+    }
+
+    private static TicketCommentResponse ToCommentResponse(TicketCommentResult comment) =>
+        new(
+            comment.Id,
+            comment.TicketId,
+            comment.AuthorUserId,
+            comment.Content,
+            comment.CreatedAt);
 
     private static IResult InvalidRequest(ArgumentException exception)
     {

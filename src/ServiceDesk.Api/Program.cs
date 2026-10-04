@@ -6,6 +6,7 @@ using ServiceDesk.Core.Application.Authentication.BootstrapAdmin;
 using ServiceDesk.Core.Application.Authentication.Login;
 using ServiceDesk.Core.Application.Tickets.CreateTicket;
 using ServiceDesk.Core.Application.Tickets.Assignment;
+using ServiceDesk.Core.Application.Tickets.Comments;
 using ServiceDesk.Core.Application.Tickets.GetTicket;
 using ServiceDesk.Core.Application.Tickets.ListTickets;
 using ServiceDesk.Core.Application.Tickets.ResolutionReview;
@@ -33,6 +34,13 @@ builder.Services.AddScoped<CreateTicketUseCase>();
 builder.Services.AddScoped<ICreateTicketPersistence, CreateTicketPersistence>();
 builder.Services.AddScoped<TicketAssignmentUseCase>();
 builder.Services.AddScoped<ITicketAssignmentPersistence, TicketAssignmentPersistence>();
+builder.Services.AddScoped<CreateTicketCommentUseCase>();
+builder.Services.AddScoped<ListTicketCommentsUseCase>();
+builder.Services.AddScoped<TicketCommentsPersistence>();
+builder.Services.AddScoped<ICreateTicketCommentPersistence>(provider =>
+    provider.GetRequiredService<TicketCommentsPersistence>());
+builder.Services.AddScoped<IListTicketCommentsQuery>(provider =>
+    provider.GetRequiredService<TicketCommentsPersistence>());
 builder.Services.AddScoped<TicketTechnicalOperationsUseCase>();
 builder.Services.AddScoped<TicketResolutionReviewUseCase>();
 builder.Services.AddScoped<GetTicketUseCase>();

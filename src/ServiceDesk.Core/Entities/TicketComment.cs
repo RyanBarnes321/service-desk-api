@@ -2,6 +2,8 @@ namespace ServiceDesk.Core.Entities;
 
 public class TicketComment
 {
+    public const int MaximumContentLength = 5_000;
+
     private TicketComment(
         Guid id,
         Guid ticketId,
@@ -43,6 +45,13 @@ public class TicketComment
         }
 
         ArgumentException.ThrowIfNullOrWhiteSpace(content);
+
+        if (content.Length > MaximumContentLength)
+        {
+            throw new ArgumentException(
+                $"Content cannot exceed {MaximumContentLength} characters.",
+                nameof(content));
+        }
 
         return new TicketComment(
             Guid.NewGuid(),
