@@ -8,10 +8,12 @@ using ServiceDesk.Core.Application.Tickets.CreateTicket;
 using ServiceDesk.Core.Application.Tickets.Assignment;
 using ServiceDesk.Core.Application.Tickets.Comments;
 using ServiceDesk.Core.Application.Tickets.GetTicket;
+using ServiceDesk.Core.Application.Tickets.History;
 using ServiceDesk.Core.Application.Tickets.ListTickets;
 using ServiceDesk.Core.Application.Tickets.ResolutionReview;
 using ServiceDesk.Core.Application.Tickets.TechnicalOperations;
 using ServiceDesk.Core.Security;
+using ServiceDesk.Core.Application.UserManagement;
 using ServiceDesk.Infrastructure.Persistence;
 using ServiceDesk.Infrastructure.Security;
 using System.Text.Json.Serialization;
@@ -45,8 +47,21 @@ builder.Services.AddScoped<TicketTechnicalOperationsUseCase>();
 builder.Services.AddScoped<TicketResolutionReviewUseCase>();
 builder.Services.AddScoped<GetTicketUseCase>();
 builder.Services.AddScoped<IGetTicketQuery, GetTicketQuery>();
+builder.Services.AddScoped<ListTicketHistoryUseCase>();
+builder.Services.AddScoped<IListTicketHistoryQuery, ListTicketHistoryQuery>();
 builder.Services.AddScoped<ListTicketsUseCase>();
 builder.Services.AddScoped<IListTicketsQuery, ListTicketsQuery>();
+builder.Services.AddScoped<ListAdminUsersUseCase>();
+builder.Services.AddScoped<GetAdminUserUseCase>();
+builder.Services.AddScoped<CreateAdminUserUseCase>();
+builder.Services.AddScoped<MutateAdminUserUseCase>();
+builder.Services.AddScoped<AdminUserPersistence>();
+builder.Services.AddScoped<IAdminUserQuery>(provider =>
+    provider.GetRequiredService<AdminUserPersistence>());
+builder.Services.AddScoped<ICreateAdminUserPersistence>(provider =>
+    provider.GetRequiredService<AdminUserPersistence>());
+builder.Services.AddScoped<IAdminUserMutationPersistence>(provider =>
+    provider.GetRequiredService<AdminUserPersistence>());
 builder.Services.AddDbContext<ServiceDeskDbContext>(options =>
     options.UseNpgsql(
         builder.Configuration.GetConnectionString("ServiceDesk"),
@@ -102,6 +117,7 @@ app.UseAuthorization();
 
 app.MapAuthenticationEndpoints();
 app.MapTicketEndpoints();
+app.MapAdminUserEndpoints();
 
 app.Run();
 

@@ -4,6 +4,7 @@ using ServiceDesk.Core.Application.Tickets.Assignment;
 using ServiceDesk.Core.Application.Tickets.Comments;
 using ServiceDesk.Core.Application.Tickets.CreateTicket;
 using ServiceDesk.Core.Application.Tickets.GetTicket;
+using ServiceDesk.Core.Application.Tickets.History;
 using ServiceDesk.Core.Application.Tickets.ListTickets;
 using ServiceDesk.Core.Application.Tickets.ResolutionReview;
 using ServiceDesk.Core.Application.Tickets.TechnicalOperations;
@@ -33,6 +34,7 @@ public static class TicketEndpoints
         tickets.MapPost("/{id:guid}/reject-resolution", RejectResolutionAsync);
         tickets.MapPost("/{id:guid}/comments", CreateCommentAsync);
         tickets.MapGet("/{id:guid}/comments", ListCommentsAsync);
+        tickets.MapGet("/{id:guid}/history", ListHistoryAsync);
         tickets.RequireAuthorization(ActiveUserPolicy.Name);
 
         return endpoints;
@@ -528,6 +530,54 @@ public static class TicketEndpoints
             comment.AuthorUserId,
             comment.Content,
             comment.CreatedAt);
+
+    private static async Task<IResult> ListHistoryAsync(
+        Guid id,
+        [AsParameters] ListTicketHistoryQueryRequest request,
+        ListTicketHistoryUseCase useCase,
+        HttpContext httpContext,
+        CancellationToken cancellationToken)
+    {
+        if (!RequestActorContext.TryGet(httpContext, out var actor))
+        {
+            return Results.Forbid();
+        }
+
+        ListTicketHistoryResult? result;
+        try
+        {
+            result = await useCase.ExecuteAsync(
+                id,
+                new ListTicketHistoryRequest(
+                    request.Page ?? ListTicketHistoryRequest.DefaultPage,
+                    request.PageSize ?? ListTicketHistoryRequest.DefaultPageSize),
+                actor,
+                cancellationToken);
+        }
+        catch (TicketHistoryValidationException exception)
+        {
+            return InvalidRequest(exception);
+        }
+
+        if (result is null)
+        {
+            return Results.NotFound();
+        }
+
+        return Results.Ok(new ListTicketHistoryResponse(
+            result.Items.Select(item => new TicketHistoryResponse(
+                item.Id,
+                item.TicketId,
+                item.PerformedByUserId,
+                item.EventType,
+                item.OldValue,
+                item.NewValue,
+                item.CreatedAt)).ToArray(),
+            result.Page,
+            result.PageSize,
+            result.TotalCount,
+            result.TotalPages));
+    }
 
     private static IResult InvalidRequest(ArgumentException exception)
     {
