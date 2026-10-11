@@ -7,7 +7,17 @@ public static class AuthenticationEndpoints
 {
     public static IEndpointRouteBuilder MapAuthenticationEndpoints(this IEndpointRouteBuilder endpoints)
     {
-        endpoints.MapPost("/api/auth/login", LoginAsync).AllowAnonymous();
+        endpoints.MapPost("/api/auth/login", LoginAsync)
+            .AllowAnonymous()
+            .WithTags("Authentication")
+            .WithSummary("Log in")
+            .WithDescription(
+                "Normalizes the email and returns a 60-minute HS256 bearer token. Missing users, " +
+                "inactive users, bad passwords, and blank credentials share the same 401 response. " +
+                "Example: {\"email\":\"admin@example.test\",\"password\":\"local-password\"}.")
+            .Produces<LoginResponse>(StatusCodes.Status200OK)
+            .ProducesProblem(StatusCodes.Status400BadRequest)
+            .ProducesProblem(StatusCodes.Status401Unauthorized);
         return endpoints;
     }
 

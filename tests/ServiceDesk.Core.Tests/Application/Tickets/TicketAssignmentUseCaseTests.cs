@@ -364,7 +364,7 @@ public class TicketAssignmentUseCaseTests
     {
         var persistence = new RecordingPersistence(
             OpenTicket(),
-            TicketAssignmentPersistenceOutcome.ConcurrencyConflict);
+            TicketMutationPersistenceOutcome.ConcurrencyConflict);
         var useCase = UseCase(persistence);
 
         var result = await useCase.ClaimAsync(
@@ -496,8 +496,8 @@ public class TicketAssignmentUseCaseTests
 
     private sealed class RecordingPersistence(
         Ticket? ticket,
-        TicketAssignmentPersistenceOutcome outcome = TicketAssignmentPersistenceOutcome.Persisted,
-        Exception? exception = null) : ITicketAssignmentPersistence
+        TicketMutationPersistenceOutcome outcome = TicketMutationPersistenceOutcome.Persisted,
+        Exception? exception = null) : ITicketMutationPersistence
     {
         public Ticket? Ticket { get; } = ticket;
 
@@ -515,7 +515,7 @@ public class TicketAssignmentUseCaseTests
             return Task.FromResult(Ticket?.Id == ticketId ? Ticket : null);
         }
 
-        public Task<TicketAssignmentPersistenceOutcome> PersistAsync(
+        public Task<TicketMutationPersistenceOutcome> PersistAsync(
             Ticket persistedTicket,
             IReadOnlyCollection<TicketHistory> histories,
             CancellationToken cancellationToken)

@@ -6,7 +6,7 @@ using ServiceDesk.Core.Enums;
 namespace ServiceDesk.Core.Application.Tickets.ResolutionReview;
 
 public sealed class TicketResolutionReviewUseCase(
-    ITicketAssignmentPersistence persistence,
+    ITicketMutationPersistence persistence,
     TimeProvider timeProvider)
 {
     public Task<TicketResolutionReviewResult> CloseAsync(
@@ -85,12 +85,12 @@ public sealed class TicketResolutionReviewUseCase(
             ];
 
         var persistenceOutcome = await persistence.PersistAsync(ticket, histories, cancellationToken);
-        if (persistenceOutcome == TicketAssignmentPersistenceOutcome.ConcurrencyConflict)
+        if (persistenceOutcome == TicketMutationPersistenceOutcome.ConcurrencyConflict)
         {
             return new(TicketResolutionReviewOutcome.ConcurrencyConflict);
         }
 
-        if (persistenceOutcome != TicketAssignmentPersistenceOutcome.Persisted)
+        if (persistenceOutcome != TicketMutationPersistenceOutcome.Persisted)
         {
             throw new InvalidOperationException("Ticket mutation persistence returned an unknown outcome.");
         }

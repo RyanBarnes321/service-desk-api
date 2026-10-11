@@ -754,7 +754,7 @@ public class TicketEndpointsTests
         await using var factory = new TicketApiFactory(
             persistedRole: UserRole.Technician,
             assignmentTicket: ticket,
-            assignmentOutcome: TicketAssignmentPersistenceOutcome.ConcurrencyConflict);
+            assignmentOutcome: TicketMutationPersistenceOutcome.ConcurrencyConflict);
         using var client = factory.CreateHttpsClient();
 
         var response = await client.PostAsync($"/api/tickets/{ticket.Id}/claim", null);
@@ -1294,7 +1294,7 @@ public class TicketEndpointsTests
             persistedRole: UserRole.Technician,
             currentUserId: userId,
             assignmentTicket: ticket,
-            assignmentOutcome: TicketAssignmentPersistenceOutcome.ConcurrencyConflict);
+            assignmentOutcome: TicketMutationPersistenceOutcome.ConcurrencyConflict);
         using var client = factory.CreateHttpsClient();
 
         var response = await client.PostAsync($"/api/tickets/{ticket.Id}/start", null);
@@ -1519,7 +1519,7 @@ public class TicketEndpointsTests
         await using var factory = new TicketApiFactory(
             persistedRole: UserRole.Administrator,
             assignmentTicket: ticket,
-            assignmentOutcome: TicketAssignmentPersistenceOutcome.ConcurrencyConflict);
+            assignmentOutcome: TicketMutationPersistenceOutcome.ConcurrencyConflict);
         using var client = factory.CreateHttpsClient();
 
         var response = await client.PostAsync($"/api/tickets/{ticket.Id}/close", null);
@@ -2257,8 +2257,8 @@ public class TicketEndpointsTests
             Guid? currentUserId = null,
             bool currentUserExists = true,
             Ticket? assignmentTicket = null,
-            TicketAssignmentPersistenceOutcome assignmentOutcome =
-                TicketAssignmentPersistenceOutcome.Persisted,
+            TicketMutationPersistenceOutcome assignmentOutcome =
+                TicketMutationPersistenceOutcome.Persisted,
             Exception? assignmentException = null,
             CurrentUserState? targetUserState = null,
             Guid? commentTicketId = null,
@@ -2282,7 +2282,7 @@ public class TicketEndpointsTests
                 persistedRole,
                 currentUserExists,
                 targetUserState);
-            AssignmentPersistence = new RecordingTicketAssignmentPersistence(
+            AssignmentPersistence = new RecordingTicketMutationPersistence(
                 assignmentTicket,
                 assignmentOutcome,
                 assignmentException);
@@ -2309,7 +2309,7 @@ public class TicketEndpointsTests
 
         public StubCurrentUserStateQuery UserState { get; }
 
-        public RecordingTicketAssignmentPersistence AssignmentPersistence { get; }
+        public RecordingTicketMutationPersistence AssignmentPersistence { get; }
 
         public StubTicketCommentsPersistence CommentsPersistence { get; }
 
@@ -2349,7 +2349,7 @@ public class TicketEndpointsTests
                 services.RemoveAll<IGetTicketQuery>();
                 services.RemoveAll<IListTicketsQuery>();
                 services.RemoveAll<ICurrentUserStateQuery>();
-                services.RemoveAll<ITicketAssignmentPersistence>();
+                services.RemoveAll<ITicketMutationPersistence>();
                 services.RemoveAll<ICreateTicketCommentPersistence>();
                 services.RemoveAll<IListTicketCommentsQuery>();
                 services.RemoveAll<IListTicketHistoryQuery>();
@@ -2357,7 +2357,7 @@ public class TicketEndpointsTests
                 services.AddSingleton<IGetTicketQuery>(Query);
                 services.AddSingleton<IListTicketsQuery>(ListQuery);
                 services.AddSingleton<ICurrentUserStateQuery>(UserState);
-                services.AddSingleton<ITicketAssignmentPersistence>(AssignmentPersistence);
+                services.AddSingleton<ITicketMutationPersistence>(AssignmentPersistence);
                 services.AddSingleton<ICreateTicketCommentPersistence>(CommentsPersistence);
                 services.AddSingleton<IListTicketCommentsQuery>(CommentsPersistence);
                 services.AddSingleton<IListTicketHistoryQuery>(HistoryQuery);
@@ -2408,10 +2408,10 @@ public class TicketEndpointsTests
         }
     }
 
-    private sealed class RecordingTicketAssignmentPersistence(
+    private sealed class RecordingTicketMutationPersistence(
         Ticket? ticket,
-        TicketAssignmentPersistenceOutcome outcome,
-        Exception? exception) : ITicketAssignmentPersistence
+        TicketMutationPersistenceOutcome outcome,
+        Exception? exception) : ITicketMutationPersistence
     {
         public Ticket? Ticket { get; } = ticket;
 
@@ -2427,7 +2427,7 @@ public class TicketEndpointsTests
             return Task.FromResult(Ticket?.Id == ticketId ? Ticket : null);
         }
 
-        public Task<TicketAssignmentPersistenceOutcome> PersistAsync(
+        public Task<TicketMutationPersistenceOutcome> PersistAsync(
             Ticket persistedTicket,
             IReadOnlyCollection<TicketHistory> histories,
             CancellationToken cancellationToken)

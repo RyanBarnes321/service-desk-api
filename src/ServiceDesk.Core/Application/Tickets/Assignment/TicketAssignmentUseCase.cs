@@ -5,7 +5,7 @@ using ServiceDesk.Core.Enums;
 namespace ServiceDesk.Core.Application.Tickets.Assignment;
 
 public sealed class TicketAssignmentUseCase(
-    ITicketAssignmentPersistence persistence,
+    ITicketMutationPersistence persistence,
     ICurrentUserStateQuery userStateQuery,
     TimeProvider timeProvider)
 {
@@ -116,12 +116,12 @@ public sealed class TicketAssignmentUseCase(
         }
 
         var persistenceOutcome = await persistence.PersistAsync(ticket, histories, cancellationToken);
-        if (persistenceOutcome == TicketAssignmentPersistenceOutcome.ConcurrencyConflict)
+        if (persistenceOutcome == TicketMutationPersistenceOutcome.ConcurrencyConflict)
         {
             return new TicketAssignmentResult(TicketAssignmentOutcome.ConcurrencyConflict);
         }
 
-        if (persistenceOutcome != TicketAssignmentPersistenceOutcome.Persisted)
+        if (persistenceOutcome != TicketMutationPersistenceOutcome.Persisted)
         {
             throw new InvalidOperationException("Ticket assignment persistence returned an unknown outcome.");
         }

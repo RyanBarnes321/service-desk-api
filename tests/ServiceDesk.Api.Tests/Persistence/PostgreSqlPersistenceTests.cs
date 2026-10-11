@@ -1,7 +1,10 @@
 using System.Data.Common;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Diagnostics;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Diagnostics.HealthChecks;
 using Npgsql;
+using ServiceDesk.Api.Health;
 using ServiceDesk.Core.Application.Authentication;
 using ServiceDesk.Core.Application.Authentication.Login;
 using ServiceDesk.Core.Application.Tickets.GetTicket;
@@ -24,6 +27,22 @@ public class PostgreSqlPersistenceTests
 {
     private static string ConnectionString =>
         Environment.GetEnvironmentVariable("SERVICE_DESK_INTEGRATION_CONNECTION_STRING")!;
+
+    [PostgreSqlIntegrationFact]
+    public async Task DatabaseMigrationHealthCheck_CurrentDatabase_IsHealthy()
+    {
+        var services = new ServiceCollection();
+        services.AddDbContext<ServiceDeskDbContext>(options => options.UseNpgsql(
+            ConnectionString,
+            npgsqlOptions => npgsqlOptions.MigrationsHistoryTable("__ef_migrations_history")));
+        await using var provider = services.BuildServiceProvider();
+        var healthCheck = new DatabaseMigrationHealthCheck(
+            provider.GetRequiredService<IServiceScopeFactory>());
+
+        var result = await healthCheck.CheckHealthAsync(new HealthCheckContext());
+
+        Assert.Equal(HealthStatus.Healthy, result.Status);
+    }
 
     [PostgreSqlIntegrationFact]
     public async Task User_RoundTripsThroughPostgreSql()
@@ -528,8 +547,8 @@ public class PostgreSqlPersistenceTests
 
             await using var firstContext = CreateContext();
             await using var staleContext = CreateContext();
-            var firstPersistence = new TicketAssignmentPersistence(firstContext);
-            var stalePersistence = new TicketAssignmentPersistence(staleContext);
+            var firstPersistence = new TicketMutationPersistence(firstContext);
+            var stalePersistence = new TicketMutationPersistence(staleContext);
             var firstTicket = await firstPersistence.FindTrackedAsync(ticket.Id, CancellationToken.None);
             var staleTicket = await stalePersistence.FindTrackedAsync(ticket.Id, CancellationToken.None);
             Assert.NotNull(firstTicket);
@@ -559,8 +578,8 @@ public class PostgreSqlPersistenceTests
                 staleHistories,
                 CancellationToken.None);
 
-            Assert.Equal(TicketAssignmentPersistenceOutcome.Persisted, firstOutcome);
-            Assert.Equal(TicketAssignmentPersistenceOutcome.ConcurrencyConflict, staleOutcome);
+            Assert.Equal(TicketMutationPersistenceOutcome.Persisted, firstOutcome);
+            Assert.Equal(TicketMutationPersistenceOutcome.ConcurrencyConflict, staleOutcome);
 
             await using (var verificationContext = CreateContext())
             {
@@ -581,7 +600,7 @@ public class PostgreSqlPersistenceTests
 
             await using (var sequentialContext = CreateContext())
             {
-                var sequentialPersistence = new TicketAssignmentPersistence(sequentialContext);
+                var sequentialPersistence = new TicketMutationPersistence(sequentialContext);
                 var sequentialTicket = await sequentialPersistence.FindTrackedAsync(
                     ticket.Id,
                     CancellationToken.None);
@@ -601,7 +620,7 @@ public class PostgreSqlPersistenceTests
                     [history],
                     CancellationToken.None);
 
-                Assert.Equal(TicketAssignmentPersistenceOutcome.Persisted, outcome);
+                Assert.Equal(TicketMutationPersistenceOutcome.Persisted, outcome);
             }
 
             await using var finalContext = CreateContext();
@@ -656,7 +675,7 @@ public class PostgreSqlPersistenceTests
 
             await using (var mutationContext = CreateContext())
             {
-                var persistence = new TicketAssignmentPersistence(mutationContext);
+                var persistence = new TicketMutationPersistence(mutationContext);
                 var useCase = new TicketTechnicalOperationsUseCase(
                     persistence,
                     new FixedTimeProvider(occurredAt));
@@ -725,7 +744,7 @@ public class PostgreSqlPersistenceTests
             await using (var mutationContext = CreateContext())
             {
                 var useCase = new TicketResolutionReviewUseCase(
-                    new TicketAssignmentPersistence(mutationContext),
+                    new TicketMutationPersistence(mutationContext),
                     new FixedTimeProvider(occurredAt));
 
                 var result = await useCase.RejectResolutionAsync(
@@ -1039,6 +1058,117 @@ public class PostgreSqlPersistenceTests
         }
     }
 
+    [PostgreSqlIntegrationFact]
+    public async Task AdminUserPersistence_SerializationExceptionShapes_MapNarrowlyAndRollBack()
+    {
+        var createdAt = UtcNowAtPostgreSqlPrecision();
+        var actor = User.Create(
+            $"serialization-actor-{Guid.NewGuid():N}@example.com", "hash", "Serial", "Actor",
+            UserRole.Administrator, createdAt);
+        var targets = Enumerable.Range(0, 6)
+            .Select(index => User.Create(
+                $"serialization-target-{index}-{Guid.NewGuid():N}@example.com",
+                "hash",
+                "Serial",
+                $"Target{index}",
+                UserRole.Administrator,
+                createdAt))
+            .ToArray();
+
+        static PostgresException SerializationFailure() => new(
+            "serialization failure",
+            "ERROR",
+            "ERROR",
+            PostgresErrorCodes.SerializationFailure);
+
+        Func<Exception>[] recognizedFactories =
+        [
+            () => SerializationFailure(),
+            () => new DbUpdateException("write failed", SerializationFailure()),
+            () => new InvalidOperationException(
+                "execution strategy failed",
+                new DbUpdateException("write failed", SerializationFailure()))
+        ];
+
+        try
+        {
+            await using (var setupContext = CreateContext())
+            {
+                setupContext.Users.Add(actor);
+                setupContext.Users.AddRange(targets);
+                await setupContext.SaveChangesAsync();
+            }
+
+            for (var index = 0; index < recognizedFactories.Length; index++)
+            {
+                var interceptor = new ThrowOnSaveInterceptor(recognizedFactories[index]);
+                await using var context = CreateContext(interceptor);
+                var result = await new AdminUserPersistence(context).ExecuteAsync(
+                    new AdminUserMutationRequest(
+                        actor.Id,
+                        targets[index].Id,
+                        AdminUserMutation.Deactivate),
+                    CancellationToken.None);
+
+                Assert.Equal(AdminUserOutcome.Conflict, result.Outcome);
+                Assert.Equal(1, interceptor.SaveAttempts);
+
+                await using var verificationContext = CreateContext();
+                Assert.True((await verificationContext.Users
+                    .SingleAsync(user => user.Id == targets[index].Id)).IsActive);
+            }
+
+            (Type ExceptionType, Func<Exception> Factory)[] unrelatedFactories =
+            [
+                (typeof(DbUpdateException), () => new DbUpdateException(
+                    "unrelated write failure",
+                    new PostgresException(
+                        "unique violation",
+                        "ERROR",
+                        "ERROR",
+                        PostgresErrorCodes.UniqueViolation))),
+                (typeof(InvalidOperationException), () => new InvalidOperationException(
+                    "unrelated execution failure",
+                    new DbUpdateException(
+                        "unrelated write failure",
+                        new PostgresException(
+                            "unique violation",
+                            "ERROR",
+                            "ERROR",
+                            PostgresErrorCodes.UniqueViolation)))),
+                (typeof(InvalidOperationException), () =>
+                    new InvalidOperationException("unrelated failure"))
+            ];
+
+            for (var index = 0; index < unrelatedFactories.Length; index++)
+            {
+                var unrelatedTargetId = targets[recognizedFactories.Length + index].Id;
+                var unrelatedInterceptor = new ThrowOnSaveInterceptor(
+                    unrelatedFactories[index].Factory);
+                await using var unrelatedContext = CreateContext(unrelatedInterceptor);
+                var exception = await Record.ExceptionAsync(() =>
+                    new AdminUserPersistence(unrelatedContext).ExecuteAsync(
+                        new AdminUserMutationRequest(
+                            actor.Id,
+                            unrelatedTargetId,
+                            AdminUserMutation.Deactivate),
+                        CancellationToken.None));
+
+                Assert.NotNull(exception);
+                Assert.Equal(unrelatedFactories[index].ExceptionType, exception.GetType());
+                Assert.Equal(1, unrelatedInterceptor.SaveAttempts);
+
+                await using var verificationContext = CreateContext();
+                Assert.True((await verificationContext.Users
+                    .SingleAsync(user => user.Id == unrelatedTargetId)).IsActive);
+            }
+        }
+        finally
+        {
+            await DeleteUsersAsync([actor.Id, .. targets.Select(target => target.Id)]);
+        }
+    }
+
     private static ServiceDeskDbContext CreateContext(params IInterceptor[] interceptors)
     {
         var optionsBuilder = new DbContextOptionsBuilder<ServiceDeskDbContext>()
@@ -1085,6 +1215,21 @@ public class PostgreSqlPersistenceTests
                    commandText.Contains("users", StringComparison.OrdinalIgnoreCase) &&
                    commandText.Contains("is_active", StringComparison.OrdinalIgnoreCase) &&
                    commandText.Contains("role", StringComparison.OrdinalIgnoreCase);
+        }
+    }
+
+    private sealed class ThrowOnSaveInterceptor(Func<Exception> exceptionFactory)
+        : SaveChangesInterceptor
+    {
+        public int SaveAttempts { get; private set; }
+
+        public override ValueTask<InterceptionResult<int>> SavingChangesAsync(
+            DbContextEventData eventData,
+            InterceptionResult<int> result,
+            CancellationToken cancellationToken = default)
+        {
+            SaveAttempts++;
+            throw exceptionFactory();
         }
     }
 

@@ -9,11 +9,54 @@ public static class AdminUserEndpoints
     public static IEndpointRouteBuilder MapAdminUserEndpoints(this IEndpointRouteBuilder endpoints)
     {
         var users = endpoints.MapGroup("/api/users");
-        users.MapGet("/", ListAsync);
-        users.MapGet("/{id:guid}", GetAsync);
-        users.MapPost("/", CreateAsync);
-        users.MapPut("/{id:guid}/role", ChangeRoleAsync);
-        users.MapPut("/{id:guid}/activation", SetActivationAsync);
+        users.MapGet("/", ListAsync)
+            .WithSummary("List users")
+            .WithDescription("Administrator-only deterministic user pagination. Password hashes are never returned.")
+            .Produces<ListAdminUsersResponse>(StatusCodes.Status200OK)
+            .ProducesProblem(StatusCodes.Status400BadRequest)
+            .Produces(StatusCodes.Status401Unauthorized)
+            .Produces(StatusCodes.Status403Forbidden);
+        users.MapGet("/{id:guid}", GetAsync)
+            .WithSummary("Get a user")
+            .WithDescription("Administrator-only safe account projection by ID.")
+            .Produces<AdminUserResponse>(StatusCodes.Status200OK)
+            .ProducesProblem(StatusCodes.Status400BadRequest)
+            .Produces(StatusCodes.Status401Unauthorized)
+            .Produces(StatusCodes.Status403Forbidden)
+            .Produces(StatusCodes.Status404NotFound);
+        users.MapPost("/", CreateAsync)
+            .WithSummary("Create a managed user")
+            .WithDescription(
+                "Administrator-only creation of an Employee or Technician. Email is normalized and unique. " +
+                "Example role value: \"Technician\".")
+            .Produces<AdminUserResponse>(StatusCodes.Status201Created)
+            .ProducesProblem(StatusCodes.Status400BadRequest)
+            .Produces(StatusCodes.Status401Unauthorized)
+            .Produces(StatusCodes.Status403Forbidden)
+            .ProducesProblem(StatusCodes.Status409Conflict);
+        users.MapPut("/{id:guid}/role", ChangeRoleAsync)
+            .WithSummary("Change a user's role")
+            .WithDescription(
+                "Administrator-only role change. Self-demotion, removal of the final active Administrator, " +
+                "and serializable write conflicts return 409.")
+            .Produces<AdminUserResponse>(StatusCodes.Status200OK)
+            .ProducesProblem(StatusCodes.Status400BadRequest)
+            .Produces(StatusCodes.Status401Unauthorized)
+            .Produces(StatusCodes.Status403Forbidden)
+            .Produces(StatusCodes.Status404NotFound)
+            .ProducesProblem(StatusCodes.Status409Conflict);
+        users.MapPut("/{id:guid}/activation", SetActivationAsync)
+            .WithSummary("Activate or deactivate a user")
+            .WithDescription(
+                "Administrator-only activation control. Self-deactivation, removal of the final active " +
+                "Administrator, and serializable write conflicts return 409.")
+            .Produces<AdminUserResponse>(StatusCodes.Status200OK)
+            .ProducesProblem(StatusCodes.Status400BadRequest)
+            .Produces(StatusCodes.Status401Unauthorized)
+            .Produces(StatusCodes.Status403Forbidden)
+            .Produces(StatusCodes.Status404NotFound)
+            .ProducesProblem(StatusCodes.Status409Conflict);
+        users.WithTags("Users");
         users.RequireAuthorization(ActiveUserPolicy.Name);
         return endpoints;
     }

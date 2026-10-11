@@ -4,8 +4,8 @@ using ServiceDesk.Core.Entities;
 
 namespace ServiceDesk.Infrastructure.Persistence;
 
-public sealed class TicketAssignmentPersistence(ServiceDeskDbContext dbContext)
-    : ITicketAssignmentPersistence
+public sealed class TicketMutationPersistence(ServiceDeskDbContext dbContext)
+    : ITicketMutationPersistence
 {
     public Task<Ticket?> FindTrackedAsync(Guid ticketId, CancellationToken cancellationToken)
     {
@@ -14,7 +14,7 @@ public sealed class TicketAssignmentPersistence(ServiceDeskDbContext dbContext)
             cancellationToken);
     }
 
-    public async Task<TicketAssignmentPersistenceOutcome> PersistAsync(
+    public async Task<TicketMutationPersistenceOutcome> PersistAsync(
         Ticket ticket,
         IReadOnlyCollection<TicketHistory> histories,
         CancellationToken cancellationToken)
@@ -24,11 +24,11 @@ public sealed class TicketAssignmentPersistence(ServiceDeskDbContext dbContext)
         try
         {
             await dbContext.SaveChangesAsync(cancellationToken);
-            return TicketAssignmentPersistenceOutcome.Persisted;
+            return TicketMutationPersistenceOutcome.Persisted;
         }
         catch (DbUpdateConcurrencyException)
         {
-            return TicketAssignmentPersistenceOutcome.ConcurrencyConflict;
+            return TicketMutationPersistenceOutcome.ConcurrencyConflict;
         }
     }
 }

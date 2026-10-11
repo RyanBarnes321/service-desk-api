@@ -1,15 +1,18 @@
 name: service-desk-api
 
+x-api-environment: &api-environment
+  ConnectionStrings__ServiceDesk: Host=postgres;Port=5432;Database=${POSTGRES_DB:-service_desk};Username=${POSTGRES_USER:-servicedesk};Password=${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+  Jwt__SigningKey: ${JWT_SIGNING_KEY:?Set JWT_SIGNING_KEY in .env}
+  Jwt__Issuer: ${JWT_ISSUER:-service-desk-api}
+  Jwt__Audience: ${JWT_AUDIENCE:-service-desk-clients}
+
 services:
   postgres:
     image: postgres:18.6
-    container_name: service-desk-postgres
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-service_desk}
       POSTGRES_USER: ${POSTGRES_USER:-servicedesk}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
-    ports:
-      - "${POSTGRES_PORT:-5433}:5432"
     volumes:
       - service_desk_postgres_data:/var/lib/postgresql
     healthcheck:
@@ -17,6 +20,36 @@ services:
       interval: 5s
       timeout: 5s
       retries: 12
+      start_period: 10s
+
+  migrate:
+    build:
+      context: .
+      target: runtime
+    environment: *api-environment
+    command: ["migrate"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  api:
+    build:
+      context: .
+      target: runtime
+    environment:
+      <<: *api-environment
+      ASPNETCORE_URLS: http://+:8080
+    ports:
+      - "${API_PORT:-8080}:8080"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
       start_period: 10s
 
 volumes:

@@ -1,0 +1,94 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18.6
+        env:
+          POSTGRES_DB: service_desk_ci
+          POSTGRES_USER: servicedesk_ci
+          POSTGRES_PASSWORD: ci-only-password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U servicedesk_ci -d service_desk_ci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+
+    env:
+      CI_CONNECTION_STRING: Host=127.0.0.1;Port=5432;Database=service_desk_ci;Username=servicedesk_ci;Password=ci-only-password
+      Jwt__SigningKey: ci-only-signing-key-that-is-longer-than-thirty-two-bytes
+      Jwt__Issuer: service-desk-api-ci
+      Jwt__Audience: service-desk-api-ci-clients
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Restore
+        run: dotnet restore ServiceDesk.slnx
+
+      - name: Build
+        run: dotnet build ServiceDesk.slnx --configuration Release --no-restore
+
+      - name: Core tests
+        run: dotnet test tests/ServiceDesk.Core.Tests --configuration Release --no-build --logger "trx;LogFileName=core.trx"
+
+      - name: API tests without PostgreSQL integration suite
+        run: dotnet test tests/ServiceDesk.Api.Tests --configuration Release --no-build --filter "FullyQualifiedName!~PostgreSqlPersistenceTests" --logger "trx;LogFileName=api.trx"
+
+      - name: Install EF migration tool
+        run: |
+          dotnet tool install --global dotnet-ef --version 10.0.12
+          echo "$HOME/.dotnet/tools" >> "$GITHUB_PATH"
+
+      - name: Apply migrations
+        env:
+          ConnectionStrings__ServiceDesk: ${{ env.CI_CONNECTION_STRING }}
+        run: dotnet ef database update --project src/ServiceDesk.Infrastructure --startup-project src/ServiceDesk.Api --configuration Release --no-build
+
+      - name: PostgreSQL integration tests
+        env:
+          SERVICE_DESK_INTEGRATION_CONNECTION_STRING: ${{ env.CI_CONNECTION_STRING }}
+        run: dotnet test tests/ServiceDesk.Api.Tests --configuration Release --no-build --filter "FullyQualifiedName~PostgreSqlPersistenceTests" --logger "trx;LogFileName=postgres.trx" --results-directory TestResults/PostgreSql
+
+      - name: Verify PostgreSQL tests executed without skips or failures
+        shell: pwsh
+        run: |
+          $trx = Get-ChildItem TestResults/PostgreSql -Filter postgres.trx -Recurse | Select-Object -First 1
+          if (-not $trx) { throw "PostgreSQL TRX result was not produced." }
+          [xml]$result = Get-Content $trx.FullName
+          $counters = $result.TestRun.ResultSummary.Counters
+          $total = [int]$counters.total
+          $executed = [int]$counters.executed
+          $passed = [int]$counters.passed
+          $failed = [int]$counters.failed
+          $notExecuted = [int]$counters.notExecuted
+          if ($total -le 0) { throw "No PostgreSQL integration tests were discovered." }
+          if ($executed -ne $total -or $passed -ne $total -or $failed -ne 0 -or $notExecuted -ne 0) {
+            throw "PostgreSQL tests were not all executed and passed: total=$total executed=$executed passed=$passed failed=$failed notExecuted=$notExecuted"
+          }
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: |
+            **/TestResults/*.trx
+            TestResults/**/*.trx

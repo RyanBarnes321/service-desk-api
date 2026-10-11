@@ -138,16 +138,7 @@ public sealed class AdminUserPersistence(ServiceDeskDbContext dbContext)
 
             return new(AdminUserOutcome.Success, AdminUserResult.From(target));
         }
-        catch (PostgresException exception)
-            when (exception.SqlState == PostgresErrorCodes.SerializationFailure)
-        {
-            return new(AdminUserOutcome.Conflict);
-        }
-        catch (DbUpdateException exception)
-            when (exception.InnerException is PostgresException
-            {
-                SqlState: PostgresErrorCodes.SerializationFailure
-            })
+        catch (Exception exception) when (IsSerializationFailure(exception))
         {
             return new(AdminUserOutcome.Conflict);
         }
@@ -177,6 +168,25 @@ public sealed class AdminUserPersistence(ServiceDeskDbContext dbContext)
         {
             SqlState: PostgresErrorCodes.UniqueViolation,
             ConstraintName: "ix_users_email"
+        };
+    }
+
+    private static bool IsSerializationFailure(Exception exception)
+    {
+        return exception switch
+        {
+            PostgresException postgresException =>
+                postgresException.SqlState == PostgresErrorCodes.SerializationFailure,
+            DbUpdateException { InnerException: PostgresException postgresException } =>
+                postgresException.SqlState == PostgresErrorCodes.SerializationFailure,
+            InvalidOperationException
+            {
+                InnerException: DbUpdateException
+                {
+                    InnerException: PostgresException postgresException
+                }
+            } => postgresException.SqlState == PostgresErrorCodes.SerializationFailure,
+            _ => false
         };
     }
 }

@@ -1,5 +1,8 @@
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Diagnostics.HealthChecks;
 using ServiceDesk.Api.Endpoints;
+using ServiceDesk.Api.Health;
+using ServiceDesk.Api.OpenApi;
 using ServiceDesk.Api.Security;
 using ServiceDesk.Core.Application.Authentication;
 using ServiceDesk.Core.Application.Authentication.BootstrapAdmin;
@@ -19,10 +22,14 @@ using ServiceDesk.Infrastructure.Security;
 using System.Text.Json.Serialization;
 
 var isBootstrapAdmin = args.Length == 1 && args[0] == "bootstrap-admin";
-var builder = WebApplication.CreateBuilder(isBootstrapAdmin ? [] : args);
+var isMigrate = args.Length == 1 && args[0] == "migrate";
+var isCommand = isBootstrapAdmin || isMigrate;
+var builder = WebApplication.CreateBuilder(isCommand ? [] : args);
 
-builder.Services.AddOpenApi();
+builder.Services.AddServiceDeskOpenApi();
 builder.Services.AddProblemDetails();
+builder.Services.AddHealthChecks()
+    .AddCheck<DatabaseMigrationHealthCheck>("database");
 builder.Services.ConfigureHttpJsonOptions(options =>
     options.SerializerOptions.Converters.Add(new JsonStringEnumConverter()));
 builder.Services.AddSingleton(TimeProvider.System);
@@ -35,7 +42,7 @@ builder.Services.AddScoped<IBootstrapAdminPersistence, BootstrapAdminPersistence
 builder.Services.AddScoped<CreateTicketUseCase>();
 builder.Services.AddScoped<ICreateTicketPersistence, CreateTicketPersistence>();
 builder.Services.AddScoped<TicketAssignmentUseCase>();
-builder.Services.AddScoped<ITicketAssignmentPersistence, TicketAssignmentPersistence>();
+builder.Services.AddScoped<ITicketMutationPersistence, TicketMutationPersistence>();
 builder.Services.AddScoped<CreateTicketCommentUseCase>();
 builder.Services.AddScoped<ListTicketCommentsUseCase>();
 builder.Services.AddScoped<TicketCommentsPersistence>();
@@ -67,12 +74,21 @@ builder.Services.AddDbContext<ServiceDeskDbContext>(options =>
         builder.Configuration.GetConnectionString("ServiceDesk"),
         npgsqlOptions => npgsqlOptions.MigrationsHistoryTable("__ef_migrations_history")));
 
-if (!isBootstrapAdmin)
+if (!isCommand)
 {
     builder.Services.AddServiceDeskAuthentication(builder.Configuration);
 }
 
 var app = builder.Build();
+
+if (isMigrate)
+{
+    await using var scope = app.Services.CreateAsyncScope();
+    var dbContext = scope.ServiceProvider.GetRequiredService<ServiceDeskDbContext>();
+    await dbContext.Database.MigrateAsync();
+    Console.WriteLine("Database migrations applied.");
+    return;
+}
 
 if (isBootstrapAdmin)
 {
@@ -106,10 +122,24 @@ if (isBootstrapAdmin)
     return;
 }
 
-if (app.Environment.IsDevelopment())
-{
-    app.MapOpenApi();
-}
+app.MapOpenApi();
+app.MapGet("/health", async (
+        HealthCheckService healthChecks,
+        CancellationToken cancellationToken) =>
+    {
+        var report = await healthChecks.CheckHealthAsync(cancellationToken);
+        var response = new HealthResponse(report.Status.ToString());
+        return report.Status == HealthStatus.Healthy
+            ? Results.Ok(response)
+            : Results.Json(response, statusCode: StatusCodes.Status503ServiceUnavailable);
+    })
+    .AllowAnonymous()
+    .WithTags("Operations")
+    .WithSummary("Check readiness")
+    .WithDescription(
+        "Returns 200 only when PostgreSQL is reachable and every EF migration is applied; otherwise 503.")
+    .Produces<HealthResponse>(StatusCodes.Status200OK)
+    .Produces<HealthResponse>(StatusCodes.Status503ServiceUnavailable);
 
 app.UseHttpsRedirection();
 app.UseAuthentication();
@@ -122,3 +152,5 @@ app.MapAdminUserEndpoints();
 app.Run();
 
 public partial class Program;
+
+public sealed record HealthResponse(string Status);
