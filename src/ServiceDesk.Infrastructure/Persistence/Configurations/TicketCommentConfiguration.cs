@@ -27,7 +27,7 @@ public class TicketCommentConfiguration : IEntityTypeConfiguration<TicketComment
 
         builder.Property(comment => comment.Content)
             .HasColumnName("content")
-            .HasMaxLength(5_000)
+            .HasMaxLength(TicketComment.MaximumContentLength)
             .IsRequired();
 
         builder.Property(comment => comment.CreatedAt)

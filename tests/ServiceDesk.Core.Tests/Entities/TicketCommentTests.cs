@@ -45,4 +45,26 @@ public class TicketCommentTests
         Assert.ThrowsAny<ArgumentException>(() =>
             TicketComment.Create(TicketId, AuthorUserId, content!, CreatedAt));
     }
+
+    [Fact]
+    public void Create_WithExactMaximumContent_Succeeds()
+    {
+        var content = new string('x', TicketComment.MaximumContentLength);
+
+        var comment = TicketComment.Create(TicketId, AuthorUserId, content, CreatedAt);
+
+        Assert.Equal(content, comment.Content);
+    }
+
+    [Fact]
+    public void Create_WithOverLimitContent_ThrowsArgumentException()
+    {
+        var exception = Assert.Throws<ArgumentException>(() => TicketComment.Create(
+            TicketId,
+            AuthorUserId,
+            new string('x', TicketComment.MaximumContentLength + 1),
+            CreatedAt));
+
+        Assert.Equal("content", exception.ParamName);
+    }
 }

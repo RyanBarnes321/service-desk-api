@@ -1,13 +1,21 @@
+using System.Data.Common;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Diagnostics;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Diagnostics.HealthChecks;
 using Npgsql;
+using ServiceDesk.Api.Health;
 using ServiceDesk.Core.Application.Authentication;
 using ServiceDesk.Core.Application.Authentication.Login;
 using ServiceDesk.Core.Application.Tickets.GetTicket;
+using ServiceDesk.Core.Application.Tickets.History;
 using ServiceDesk.Core.Application.Tickets.ListTickets;
 using ServiceDesk.Core.Application.Tickets;
 using ServiceDesk.Core.Application.Tickets.Assignment;
+using ServiceDesk.Core.Application.Tickets.Comments;
 using ServiceDesk.Core.Application.Tickets.ResolutionReview;
 using ServiceDesk.Core.Application.Tickets.TechnicalOperations;
+using ServiceDesk.Core.Application.UserManagement;
 using ServiceDesk.Core.Security;
 using ServiceDesk.Core.Entities;
 using ServiceDesk.Core.Enums;
@@ -19,6 +27,22 @@ public class PostgreSqlPersistenceTests
 {
     private static string ConnectionString =>
         Environment.GetEnvironmentVariable("SERVICE_DESK_INTEGRATION_CONNECTION_STRING")!;
+
+    [PostgreSqlIntegrationFact]
+    public async Task DatabaseMigrationHealthCheck_CurrentDatabase_IsHealthy()
+    {
+        var services = new ServiceCollection();
+        services.AddDbContext<ServiceDeskDbContext>(options => options.UseNpgsql(
+            ConnectionString,
+            npgsqlOptions => npgsqlOptions.MigrationsHistoryTable("__ef_migrations_history")));
+        await using var provider = services.BuildServiceProvider();
+        var healthCheck = new DatabaseMigrationHealthCheck(
+            provider.GetRequiredService<IServiceScopeFactory>());
+
+        var result = await healthCheck.CheckHealthAsync(new HealthCheckContext());
+
+        Assert.Equal(HealthStatus.Healthy, result.Status);
+    }
 
     [PostgreSqlIntegrationFact]
     public async Task User_RoundTripsThroughPostgreSql()
@@ -523,8 +547,8 @@ public class PostgreSqlPersistenceTests
 
             await using var firstContext = CreateContext();
             await using var staleContext = CreateContext();
-            var firstPersistence = new TicketAssignmentPersistence(firstContext);
-            var stalePersistence = new TicketAssignmentPersistence(staleContext);
+            var firstPersistence = new TicketMutationPersistence(firstContext);
+            var stalePersistence = new TicketMutationPersistence(staleContext);
             var firstTicket = await firstPersistence.FindTrackedAsync(ticket.Id, CancellationToken.None);
             var staleTicket = await stalePersistence.FindTrackedAsync(ticket.Id, CancellationToken.None);
             Assert.NotNull(firstTicket);
@@ -554,8 +578,8 @@ public class PostgreSqlPersistenceTests
                 staleHistories,
                 CancellationToken.None);
 
-            Assert.Equal(TicketAssignmentPersistenceOutcome.Persisted, firstOutcome);
-            Assert.Equal(TicketAssignmentPersistenceOutcome.ConcurrencyConflict, staleOutcome);
+            Assert.Equal(TicketMutationPersistenceOutcome.Persisted, firstOutcome);
+            Assert.Equal(TicketMutationPersistenceOutcome.ConcurrencyConflict, staleOutcome);
 
             await using (var verificationContext = CreateContext())
             {
@@ -576,7 +600,7 @@ public class PostgreSqlPersistenceTests
 
             await using (var sequentialContext = CreateContext())
             {
-                var sequentialPersistence = new TicketAssignmentPersistence(sequentialContext);
+                var sequentialPersistence = new TicketMutationPersistence(sequentialContext);
                 var sequentialTicket = await sequentialPersistence.FindTrackedAsync(
                     ticket.Id,
                     CancellationToken.None);
@@ -596,7 +620,7 @@ public class PostgreSqlPersistenceTests
                     [history],
                     CancellationToken.None);
 
-                Assert.Equal(TicketAssignmentPersistenceOutcome.Persisted, outcome);
+                Assert.Equal(TicketMutationPersistenceOutcome.Persisted, outcome);
             }
 
             await using var finalContext = CreateContext();
@@ -651,7 +675,7 @@ public class PostgreSqlPersistenceTests
 
             await using (var mutationContext = CreateContext())
             {
-                var persistence = new TicketAssignmentPersistence(mutationContext);
+                var persistence = new TicketMutationPersistence(mutationContext);
                 var useCase = new TicketTechnicalOperationsUseCase(
                     persistence,
                     new FixedTimeProvider(occurredAt));
@@ -720,7 +744,7 @@ public class PostgreSqlPersistenceTests
             await using (var mutationContext = CreateContext())
             {
                 var useCase = new TicketResolutionReviewUseCase(
-                    new TicketAssignmentPersistence(mutationContext),
+                    new TicketMutationPersistence(mutationContext),
                     new FixedTimeProvider(occurredAt));
 
                 var result = await useCase.RejectResolutionAsync(
@@ -764,13 +788,449 @@ public class PostgreSqlPersistenceTests
         }
     }
 
-    private static ServiceDeskDbContext CreateContext()
+    [PostgreSqlIntegrationFact]
+    public async Task TicketComments_CreateAndList_PreserveTicketAndApplyVisibilityOrderingPagination()
     {
-        var options = new DbContextOptionsBuilder<ServiceDeskDbContext>()
-            .UseNpgsql(ConnectionString)
-            .Options;
+        var createdAt = UtcNowAtPostgreSqlPrecision();
+        var commentAt = createdAt.AddMinutes(1);
+        var creator = User.Create(
+            $"comment-creator-{Guid.NewGuid():N}@example.com", "hash", "Alex", "Morgan",
+            UserRole.Employee, createdAt);
+        var otherEmployee = User.Create(
+            $"other-comment-reader-{Guid.NewGuid():N}@example.com", "hash", "Other", "Reader",
+            UserRole.Employee, createdAt);
+        var technician = User.Create(
+            $"comment-technician-{Guid.NewGuid():N}@example.com", "hash", "Taylor", "Rivera",
+            UserRole.Technician, createdAt);
+        var ticket = Ticket.Create(
+            "Comment persistence", "Verify immutable comment creation and reads.",
+            TicketCategory.Software, TicketPriority.Medium, creator.Id, createdAt);
 
-        return new ServiceDeskDbContext(options);
+        try
+        {
+            await using (var setupContext = CreateContext())
+            {
+                setupContext.Users.AddRange(creator, otherEmployee, technician);
+                setupContext.Tickets.Add(ticket);
+                await setupContext.SaveChangesAsync();
+            }
+
+            TicketCommentResult first;
+            TicketCommentResult second;
+            await using (var createContext = CreateContext())
+            {
+                var persistence = new TicketCommentsPersistence(createContext);
+                var useCase = new CreateTicketCommentUseCase(
+                    persistence,
+                    new FixedTimeProvider(commentAt));
+                first = (await useCase.ExecuteAsync(
+                    ticket.Id,
+                    "Creator note",
+                    new RequestActor(creator.Id, UserRole.Employee))).Comment!;
+                second = (await useCase.ExecuteAsync(
+                    ticket.Id,
+                    "Technician note",
+                    new RequestActor(technician.Id, UserRole.Technician))).Comment!;
+            }
+
+            await using var verificationContext = CreateContext();
+            var persistenceQuery = new TicketCommentsPersistence(verificationContext);
+            var expected = new[] { first, second }
+                .OrderBy(item => item.Id.ToString(), StringComparer.Ordinal)
+                .ToArray();
+            var firstPage = await persistenceQuery.ListAsync(
+                ticket.Id,
+                new ListTicketCommentsRequest(1, 1),
+                TicketVisibilityScope.For(new RequestActor(creator.Id, UserRole.Employee)),
+                CancellationToken.None);
+            var secondPage = await persistenceQuery.ListAsync(
+                ticket.Id,
+                new ListTicketCommentsRequest(2, 1),
+                TicketVisibilityScope.For(new RequestActor(technician.Id, UserRole.Technician)),
+                CancellationToken.None);
+            var concealed = await persistenceQuery.ListAsync(
+                ticket.Id,
+                new ListTicketCommentsRequest(),
+                TicketVisibilityScope.For(new RequestActor(otherEmployee.Id, UserRole.Employee)),
+                CancellationToken.None);
+            var storedTicket = await verificationContext.Tickets
+                .SingleAsync(candidate => candidate.Id == ticket.Id);
+            var historyCount = await verificationContext.TicketHistory
+                .CountAsync(candidate => candidate.TicketId == ticket.Id);
+
+            Assert.NotNull(firstPage);
+            Assert.NotNull(secondPage);
+            Assert.Equal(expected[0].Id, Assert.Single(firstPage.Items).Id);
+            Assert.Equal(expected[1].Id, Assert.Single(secondPage.Items).Id);
+            Assert.Equal(2, firstPage.TotalCount);
+            Assert.Equal(2, firstPage.TotalPages);
+            Assert.Null(concealed);
+            Assert.Equal(createdAt, storedTicket.UpdatedAt);
+            Assert.Equal(0L, verificationContext.Entry(storedTicket).Property<long>("Version").CurrentValue);
+            Assert.Equal(0, historyCount);
+        }
+        finally
+        {
+            await DeleteTicketsAndUsersAsync(
+                [ticket.Id],
+                [creator.Id, otherEmployee.Id, technician.Id]);
+        }
+    }
+
+    [PostgreSqlIntegrationFact]
+    public async Task TicketHistoryQuery_ClosedTicket_AppliesVisibilityOrderingAndPagination()
+    {
+        var createdAt = UtcNowAtPostgreSqlPrecision();
+        var historyAt = createdAt.AddMinutes(5);
+        var creator = User.Create(
+            $"history-creator-{Guid.NewGuid():N}@example.com", "hash", "Alex", "Morgan",
+            UserRole.Employee, createdAt);
+        var otherEmployee = User.Create(
+            $"history-other-{Guid.NewGuid():N}@example.com", "hash", "Other", "Employee",
+            UserRole.Employee, createdAt);
+        var technician = User.Create(
+            $"history-technician-{Guid.NewGuid():N}@example.com", "hash", "Taylor", "Rivera",
+            UserRole.Technician, createdAt);
+        var ticket = Ticket.Create(
+            "History projection", "Verify history visibility and ordering.",
+            TicketCategory.Software, TicketPriority.High, creator.Id, createdAt);
+        ticket.Assign(technician.Id, createdAt.AddMinutes(1));
+        ticket.StartWork(createdAt.AddMinutes(2));
+        ticket.Resolve("Resolved.", createdAt.AddMinutes(3));
+        ticket.Close(createdAt.AddMinutes(4));
+        var first = TicketHistory.Create(
+            ticket.Id, creator.Id, TicketHistoryEventType.Created, null, null, historyAt);
+        var second = TicketHistory.Create(
+            ticket.Id, technician.Id, TicketHistoryEventType.Resolved, null, "Resolved.", historyAt);
+
+        try
+        {
+            await using (var setupContext = CreateContext())
+            {
+                setupContext.Users.AddRange(creator, otherEmployee, technician);
+                setupContext.Tickets.Add(ticket);
+                setupContext.TicketHistory.AddRange(first, second);
+                await setupContext.SaveChangesAsync();
+            }
+
+            await using var queryContext = CreateContext();
+            var query = new ListTicketHistoryQuery(queryContext);
+            var expectedIds = new[] { first.Id, second.Id }
+                .OrderBy(id => id.ToString(), StringComparer.Ordinal)
+                .ToArray();
+            var firstPage = await query.ListAsync(
+                ticket.Id,
+                new ListTicketHistoryRequest(1, 1),
+                TicketVisibilityScope.For(new RequestActor(creator.Id, UserRole.Employee)),
+                CancellationToken.None);
+            var secondPage = await query.ListAsync(
+                ticket.Id,
+                new ListTicketHistoryRequest(2, 1),
+                TicketVisibilityScope.For(new RequestActor(technician.Id, UserRole.Technician)),
+                CancellationToken.None);
+            var concealed = await query.ListAsync(
+                ticket.Id,
+                new ListTicketHistoryRequest(),
+                TicketVisibilityScope.For(new RequestActor(otherEmployee.Id, UserRole.Employee)),
+                CancellationToken.None);
+
+            Assert.NotNull(firstPage);
+            Assert.NotNull(secondPage);
+            Assert.Equal(expectedIds[0], Assert.Single(firstPage.Items).Id);
+            Assert.Equal(expectedIds[1], Assert.Single(secondPage.Items).Id);
+            Assert.Equal(2, firstPage.TotalCount);
+            Assert.Equal(2, firstPage.TotalPages);
+            Assert.Equal(ticket.Id, firstPage.Items[0].TicketId);
+            Assert.Equal(historyAt, firstPage.Items[0].CreatedAt);
+            Assert.Null(concealed);
+        }
+        finally
+        {
+            await DeleteTicketsAndUsersAsync(
+                [ticket.Id],
+                [creator.Id, otherEmployee.Id, technician.Id]);
+        }
+    }
+
+    [PostgreSqlIntegrationFact]
+    public async Task AdminUserPersistence_UniqueCreateProjectionMutationAndConcurrentFinalAdminSafety()
+    {
+        var createdAt = UtcNowAtPostgreSqlPrecision();
+        var firstAdmin = User.Create(
+            $"first-admin-{Guid.NewGuid():N}@example.com", "hash", "First", "Admin",
+            UserRole.Administrator, createdAt);
+        var secondAdmin = User.Create(
+            $"second-admin-{Guid.NewGuid():N}@example.com", "hash", "Second", "Admin",
+            UserRole.Administrator, createdAt);
+        var employee = User.Create(
+            $"managed-{Guid.NewGuid():N}@example.com", "hash", "Managed", "Employee",
+            UserRole.Employee, createdAt);
+        var duplicateEmail = $"duplicate-{Guid.NewGuid():N}@example.com";
+        var duplicateOne = User.Create(
+            duplicateEmail, "hash", "Duplicate", "One", UserRole.Employee, createdAt);
+        var duplicateTwo = User.Create(
+            duplicateEmail, "hash", "Duplicate", "Two", UserRole.Technician, createdAt);
+
+        try
+        {
+            await using (var setupContext = CreateContext())
+            {
+                setupContext.Users.AddRange(firstAdmin, secondAdmin, employee);
+                await setupContext.SaveChangesAsync();
+            }
+
+            await using (var createOneContext = CreateContext())
+            await using (var createTwoContext = CreateContext())
+            {
+                var firstCreate = new AdminUserPersistence(createOneContext)
+                    .CreateAsync(duplicateOne, CancellationToken.None);
+                var secondCreate = new AdminUserPersistence(createTwoContext)
+                    .CreateAsync(duplicateTwo, CancellationToken.None);
+                var createOutcomes = await Task.WhenAll(firstCreate, secondCreate);
+
+                Assert.Equal(1, createOutcomes.Count(outcome => outcome == AdminUserOutcome.Success));
+                Assert.Equal(1, createOutcomes.Count(outcome => outcome == AdminUserOutcome.DuplicateEmail));
+            }
+
+            await using (var queryContext = CreateContext())
+            {
+                var persistence = new AdminUserPersistence(queryContext);
+                var detail = await persistence.FindAsync(employee.Id, CancellationToken.None);
+                var list = await persistence.ListAsync(
+                    new ListAdminUsersRequest(1, 100),
+                    CancellationToken.None);
+
+                Assert.NotNull(detail);
+                Assert.Equal(employee.Email, detail.Email);
+                Assert.DoesNotContain(list.Items, item => item.Email.Contains("hash", StringComparison.Ordinal));
+                Assert.Contains(list.Items, item => item.Id == employee.Id);
+            }
+
+            await using (var mutationContext = CreateContext())
+            {
+                var persistence = new AdminUserPersistence(mutationContext);
+                var roleChange = await persistence.ExecuteAsync(
+                    new AdminUserMutationRequest(
+                        firstAdmin.Id,
+                        employee.Id,
+                        AdminUserMutation.ChangeRole,
+                        UserRole.Technician),
+                    CancellationToken.None);
+
+                Assert.Equal(AdminUserOutcome.Success, roleChange.Outcome);
+                Assert.Equal(UserRole.Technician, roleChange.User?.Role);
+            }
+
+            var activeAdministratorCountBarrier = new ActiveAdministratorCountBarrier();
+            await using (var firstContext = CreateContext(activeAdministratorCountBarrier))
+            await using (var secondContext = CreateContext(activeAdministratorCountBarrier))
+            {
+                var firstRemovesSecond = new AdminUserPersistence(firstContext).ExecuteAsync(
+                    new AdminUserMutationRequest(
+                        firstAdmin.Id,
+                        secondAdmin.Id,
+                        AdminUserMutation.Deactivate),
+                    CancellationToken.None);
+                var secondRemovesFirst = new AdminUserPersistence(secondContext).ExecuteAsync(
+                    new AdminUserMutationRequest(
+                        secondAdmin.Id,
+                        firstAdmin.Id,
+                        AdminUserMutation.Deactivate),
+                    CancellationToken.None);
+                var outcomes = await Task.WhenAll(firstRemovesSecond, secondRemovesFirst);
+
+                Assert.Equal(1, outcomes.Count(outcome => outcome.Outcome == AdminUserOutcome.Success));
+                Assert.Equal(1, outcomes.Count(outcome => outcome.Outcome == AdminUserOutcome.Conflict));
+            }
+
+            await using var verificationContext = CreateContext();
+            var activeAdministratorCount = await verificationContext.Users.CountAsync(
+                user => user.IsActive && user.Role == UserRole.Administrator);
+            var storedEmployee = await verificationContext.Users
+                .SingleAsync(user => user.Id == employee.Id);
+            Assert.Equal(1, activeAdministratorCount);
+            Assert.Equal(UserRole.Technician, storedEmployee.Role);
+        }
+        finally
+        {
+            await DeleteUsersAsync(
+                [firstAdmin.Id, secondAdmin.Id, employee.Id, duplicateOne.Id, duplicateTwo.Id]);
+        }
+    }
+
+    [PostgreSqlIntegrationFact]
+    public async Task AdminUserPersistence_SerializationExceptionShapes_MapNarrowlyAndRollBack()
+    {
+        var createdAt = UtcNowAtPostgreSqlPrecision();
+        var actor = User.Create(
+            $"serialization-actor-{Guid.NewGuid():N}@example.com", "hash", "Serial", "Actor",
+            UserRole.Administrator, createdAt);
+        var targets = Enumerable.Range(0, 6)
+            .Select(index => User.Create(
+                $"serialization-target-{index}-{Guid.NewGuid():N}@example.com",
+                "hash",
+                "Serial",
+                $"Target{index}",
+                UserRole.Administrator,
+                createdAt))
+            .ToArray();
+
+        static PostgresException SerializationFailure() => new(
+            "serialization failure",
+            "ERROR",
+            "ERROR",
+            PostgresErrorCodes.SerializationFailure);
+
+        Func<Exception>[] recognizedFactories =
+        [
+            () => SerializationFailure(),
+            () => new DbUpdateException("write failed", SerializationFailure()),
+            () => new InvalidOperationException(
+                "execution strategy failed",
+                new DbUpdateException("write failed", SerializationFailure()))
+        ];
+
+        try
+        {
+            await using (var setupContext = CreateContext())
+            {
+                setupContext.Users.Add(actor);
+                setupContext.Users.AddRange(targets);
+                await setupContext.SaveChangesAsync();
+            }
+
+            for (var index = 0; index < recognizedFactories.Length; index++)
+            {
+                var interceptor = new ThrowOnSaveInterceptor(recognizedFactories[index]);
+                await using var context = CreateContext(interceptor);
+                var result = await new AdminUserPersistence(context).ExecuteAsync(
+                    new AdminUserMutationRequest(
+                        actor.Id,
+                        targets[index].Id,
+                        AdminUserMutation.Deactivate),
+                    CancellationToken.None);
+
+                Assert.Equal(AdminUserOutcome.Conflict, result.Outcome);
+                Assert.Equal(1, interceptor.SaveAttempts);
+
+                await using var verificationContext = CreateContext();
+                Assert.True((await verificationContext.Users
+                    .SingleAsync(user => user.Id == targets[index].Id)).IsActive);
+            }
+
+            (Type ExceptionType, Func<Exception> Factory)[] unrelatedFactories =
+            [
+                (typeof(DbUpdateException), () => new DbUpdateException(
+                    "unrelated write failure",
+                    new PostgresException(
+                        "unique violation",
+                        "ERROR",
+                        "ERROR",
+                        PostgresErrorCodes.UniqueViolation))),
+                (typeof(InvalidOperationException), () => new InvalidOperationException(
+                    "unrelated execution failure",
+                    new DbUpdateException(
+                        "unrelated write failure",
+                        new PostgresException(
+                            "unique violation",
+                            "ERROR",
+                            "ERROR",
+                            PostgresErrorCodes.UniqueViolation)))),
+                (typeof(InvalidOperationException), () =>
+                    new InvalidOperationException("unrelated failure"))
+            ];
+
+            for (var index = 0; index < unrelatedFactories.Length; index++)
+            {
+                var unrelatedTargetId = targets[recognizedFactories.Length + index].Id;
+                var unrelatedInterceptor = new ThrowOnSaveInterceptor(
+                    unrelatedFactories[index].Factory);
+                await using var unrelatedContext = CreateContext(unrelatedInterceptor);
+                var exception = await Record.ExceptionAsync(() =>
+                    new AdminUserPersistence(unrelatedContext).ExecuteAsync(
+                        new AdminUserMutationRequest(
+                            actor.Id,
+                            unrelatedTargetId,
+                            AdminUserMutation.Deactivate),
+                        CancellationToken.None));
+
+                Assert.NotNull(exception);
+                Assert.Equal(unrelatedFactories[index].ExceptionType, exception.GetType());
+                Assert.Equal(1, unrelatedInterceptor.SaveAttempts);
+
+                await using var verificationContext = CreateContext();
+                Assert.True((await verificationContext.Users
+                    .SingleAsync(user => user.Id == unrelatedTargetId)).IsActive);
+            }
+        }
+        finally
+        {
+            await DeleteUsersAsync([actor.Id, .. targets.Select(target => target.Id)]);
+        }
+    }
+
+    private static ServiceDeskDbContext CreateContext(params IInterceptor[] interceptors)
+    {
+        var optionsBuilder = new DbContextOptionsBuilder<ServiceDeskDbContext>()
+            .UseNpgsql(ConnectionString);
+        if (interceptors.Length > 0)
+        {
+            optionsBuilder.AddInterceptors(interceptors);
+        }
+
+        return new ServiceDeskDbContext(optionsBuilder.Options);
+    }
+
+    private sealed class ActiveAdministratorCountBarrier : DbCommandInterceptor
+    {
+        private readonly TaskCompletionSource _bothCountsExecuted = new(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        private int _executedCount;
+
+        public override async ValueTask<DbDataReader> ReaderExecutedAsync(
+            DbCommand command,
+            CommandExecutedEventData eventData,
+            DbDataReader result,
+            CancellationToken cancellationToken = default)
+        {
+            if (!IsActiveAdministratorCount(command.CommandText))
+            {
+                return result;
+            }
+
+            if (Interlocked.Increment(ref _executedCount) == 2)
+            {
+                _bothCountsExecuted.TrySetResult();
+            }
+
+            await _bothCountsExecuted.Task.WaitAsync(
+                TimeSpan.FromSeconds(30),
+                cancellationToken);
+            return result;
+        }
+
+        private static bool IsActiveAdministratorCount(string commandText)
+        {
+            return commandText.Contains("count(*)", StringComparison.OrdinalIgnoreCase) &&
+                   commandText.Contains("users", StringComparison.OrdinalIgnoreCase) &&
+                   commandText.Contains("is_active", StringComparison.OrdinalIgnoreCase) &&
+                   commandText.Contains("role", StringComparison.OrdinalIgnoreCase);
+        }
+    }
+
+    private sealed class ThrowOnSaveInterceptor(Func<Exception> exceptionFactory)
+        : SaveChangesInterceptor
+    {
+        public int SaveAttempts { get; private set; }
+
+        public override ValueTask<InterceptionResult<int>> SavingChangesAsync(
+            DbContextEventData eventData,
+            InterceptionResult<int> result,
+            CancellationToken cancellationToken = default)
+        {
+            SaveAttempts++;
+            throw exceptionFactory();
+        }
     }
 
     private static Ticket AssignedTicket(
@@ -866,6 +1326,16 @@ public class PostgreSqlPersistenceTests
     {
         await using var context = CreateContext();
         await context.Database.ExecuteSqlInterpolatedAsync($"DELETE FROM users WHERE id = {userId}");
+    }
+
+    private static async Task DeleteUsersAsync(IEnumerable<Guid> userIds)
+    {
+        await using var context = CreateContext();
+        foreach (var userId in userIds)
+        {
+            await context.Database.ExecuteSqlInterpolatedAsync(
+                $"DELETE FROM users WHERE id = {userId}");
+        }
     }
 
     private static async Task DeleteTicketGraphAsync(Guid ticketId, Guid requesterId, Guid technicianId)
