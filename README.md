@@ -20,20 +20,18 @@ A portfolio-grade ASP.NET Core API for the complete service-desk ticket workflow
 
 ## Architecture
 
-```text
-ServiceDesk.Api
-  |-- HTTP contracts, JWT, current-user checks, composition
-  |---> ServiceDesk.Core
-  `----> ServiceDesk.Infrastructure
-             `----> ServiceDesk.Core
 
-ServiceDesk.Core
-  |-- domain entities and lifecycle rules
-  `-- application use cases and purpose-specific ports
+```mermaid
+flowchart TD
+    API["ServiceDesk.Api<br/>HTTP · JWT · OpenAPI"]
+    CORE["ServiceDesk.Core<br/>Domain · Application Use Cases"]
+    INFRA["ServiceDesk.Infrastructure<br/>EF Core · PostgreSQL"]
 
-ServiceDesk.Infrastructure
-  `-- EF Core queries, mutations, password adapter, migrations
+    API --> CORE
+    API --> INFRA
+    INFRA --> CORE
 ```
+
 
 There are exactly three production projects and two test projects. Core has no ASP.NET Core or EF Core dependency.
 
