@@ -1,5 +1,7 @@
 # Service Desk API
 
+[![CI](https://github.com/RyanBarnes321/service-desk-api/actions/workflows/ci.yml/badge.svg)](https://github.com/RyanBarnes321/service-desk-api/actions/workflows/ci.yml)
+
 A portfolio-grade ASP.NET Core API for the complete service-desk ticket workflow: authenticated request creation, technician assignment and work, administrator resolution review, comments, history, and bounded user administration.
 
 ## Highlights
